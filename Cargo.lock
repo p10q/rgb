@@ -2070,6 +2070,7 @@ dependencies = [
  "dirs",
  "futures",
  "git2",
+ "libc",
  "mockito",
  "notify",
  "notify-debouncer-full",
