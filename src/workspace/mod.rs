@@ -32,7 +32,9 @@ pub struct TerminalSession {
 impl WorkspaceManager {
     pub fn new(project_dir: PathBuf) -> Result<Self> {
         let git_manager = Arc::new(GitManager::new(&project_dir)?);
-        let file_tracker = Arc::new(FileTracker::new(&project_dir)?);
+        // Skip file tracker for now - it might be blocking
+        // let file_tracker = Arc::new(FileTracker::new(&project_dir)?);
+        let file_tracker = Arc::new(FileTracker::new_disabled());
 
         Ok(Self {
             terminals: Arc::new(RwLock::new(Vec::new())),
@@ -59,6 +61,8 @@ impl WorkspaceManager {
             std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
         });
 
+        tracing::info!("Creating terminal with command: {}", cmd);
+
         // Create worktree if git is enabled
         let worktree_path = if self.git_manager.is_git_repo() {
             self.git_manager.create_worktree(id).await.ok()
@@ -70,7 +74,10 @@ impl WorkspaceManager {
         let working_dir = worktree_path.clone().unwrap_or_else(|| self.project_dir.clone());
 
         // Create terminal emulator
-        let emulator = TerminalEmulator::new(&cmd, &working_dir, (80, 24))?;
+        let mut emulator = TerminalEmulator::new(&cmd, &working_dir, (80, 24))?;
+
+        // Send a carriage return to trigger shell prompt display
+        emulator.write(b"\r").ok();
 
         let session = TerminalSession {
             id,
@@ -208,8 +215,43 @@ impl WorkspaceManager {
     }
 
     pub async fn update(&self) -> Result<()> {
-        // Update file tracking
-        self.file_tracker.update()?;
+        tracing::debug!("WorkspaceManager::update start");
+
+        // Update all terminal emulators to read their output
+        let terminals = self.terminals.read();
+        tracing::debug!("Found {} terminals to update", terminals.len());
+
+        for (idx, terminal) in terminals.iter().enumerate() {
+            tracing::debug!("Attempting to update terminal {}", idx);
+
+            // Use is_some() first to avoid any potential blocking
+            if terminal.emulator.try_write().is_some() {
+                // Now get the lock
+                if let Some(mut emulator) = terminal.emulator.try_write() {
+                    tracing::debug!("Got write lock for terminal {}", idx);
+                    match emulator.update() {
+                        Ok(_) => {
+                            tracing::debug!("Terminal {} updated successfully", idx);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to update terminal {}: {}", idx, e);
+                        }
+                    }
+                } else {
+                    tracing::warn!("Lock disappeared for terminal {}", idx);
+                }
+            } else {
+                tracing::debug!("Terminal {} is locked, skipping update", idx);
+            }
+
+            tracing::debug!("Finished processing terminal {}", idx);
+        }
+        drop(terminals); // Explicitly drop the read lock
+        tracing::debug!("All terminal emulators updated");
+
+        // Skip file tracking for now - might be blocking
+        // self.file_tracker.update()?;
+        tracing::trace!("File tracker skipped");
 
         // Check for file conflicts
         let conflicts = self.detect_file_conflicts();
@@ -218,7 +260,9 @@ impl WorkspaceManager {
             tracing::warn!("File conflicts detected: {:?}", conflicts);
         }
 
-        // Sync git worktrees if needed
+        // Skip git worktree sync for now - it might be blocking
+        // TODO: Fix git worktree sync
+        /*
         if self.git_manager.is_git_repo() {
             for terminal in self.terminals.read().iter() {
                 if terminal.worktree_path.is_some() {
@@ -226,6 +270,7 @@ impl WorkspaceManager {
                 }
             }
         }
+        */
 
         Ok(())
     }

@@ -90,8 +90,6 @@ impl GitManager {
 
         // Get current branch
         let head = repo.head()?;
-        let current_branch = head.shorthand().unwrap_or("main");
-
         // Create new branch from current
         let oid = head.target()
             .ok_or_else(|| anyhow::anyhow!("HEAD has no target"))?;
@@ -99,7 +97,7 @@ impl GitManager {
         repo.branch(&branch_name, &commit, false)?;
 
         // Add worktree
-        let worktree = repo.worktree(
+        let _worktree = repo.worktree(
             &branch_name,
             &worktree_dir,
             Some(&git2::WorktreeAddOptions::new()),
@@ -179,17 +177,16 @@ impl GitManager {
                 let worktree_head = worktree_repo.head()?;
                 let worktree_oid = worktree_head.target()
                     .ok_or_else(|| anyhow::anyhow!("Worktree HEAD has no target"))?;
-                let worktree_commit = worktree_repo.find_commit(worktree_oid)?;
 
                 // Check if merge is needed
                 let merge_base = repo.merge_base(main_oid, worktree_oid)?;
 
                 if merge_base != main_oid {
                     // Merge is needed
-                    let mut merge_options = git2::MergeOptions::new();
-                    let merge_analysis = worktree_repo.merge_analysis(&[&main_commit])?;
+                    let annotated_commit = worktree_repo.find_annotated_commit(main_oid)?;
+                    let (merge_analysis, _) = worktree_repo.merge_analysis(&[&annotated_commit])?;
 
-                    if merge_analysis.0.contains(git2::MergeAnalysis::FASTFORWARD) {
+                    if merge_analysis.is_fast_forward() {
                         // Fast-forward merge
                         worktree_repo.checkout_tree(
                             main_commit.as_object(),
@@ -197,7 +194,7 @@ impl GitManager {
                         )?;
                         worktree_repo.set_head_detached(main_oid)?;
                         info.merge_status = MergeStatus::Merged;
-                    } else if merge_analysis.0.contains(git2::MergeAnalysis::NORMAL) {
+                    } else if merge_analysis.is_normal() {
                         // Regular merge needed
                         // TODO: Implement proper merge
                         info.merge_status = MergeStatus::Conflict {
@@ -259,15 +256,15 @@ impl GitManager {
     pub async fn get_diff(&self, terminal_id: Option<TerminalId>) -> Result<Vec<DiffHunk>> {
         let mut hunks = Vec::new();
 
-        if let Some(repo) = &self.repo {
+        if let Some(_repo) = &self.repo {
             let repo_to_use = if let Some(tid) = terminal_id {
-                if let Some(info) = self.worktrees.read().get(&tid) {
+                if let Some(info) = self.worktrees.read().get(&tid).cloned() {
                     Repository::open(&info.path)?
                 } else {
-                    repo.clone()
+                    Repository::open(&self.project_dir)?
                 }
             } else {
-                repo.clone()
+                Repository::open(&self.project_dir)?
             };
 
             let head = repo_to_use.head()?.peel_to_tree()?;
@@ -306,17 +303,17 @@ impl GitManager {
         files: Vec<PathBuf>,
         terminal_id: Option<TerminalId>,
     ) -> Result<String> {
-        let repo = self.repo.as_ref()
+        let _repo = self.repo.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Not a git repository"))?;
 
         let repo_to_use = if let Some(tid) = terminal_id {
-            if let Some(info) = self.worktrees.read().get(&tid) {
+            if let Some(info) = self.worktrees.read().get(&tid).cloned() {
                 Repository::open(&info.path)?
             } else {
-                repo.clone()
+                Repository::open(&self.project_dir)?
             }
         } else {
-            repo.clone()
+            Repository::open(&self.project_dir)?
         };
 
         // Add files to index

@@ -152,6 +152,14 @@ fn default_terminals() -> HashMap<String, TerminalConfig> {
 }
 
 pub fn load_config(config_path: Option<PathBuf>) -> Result<AppConfig> {
+    // If no config path is specified and no configs exist, just use defaults
+    let has_config = config_path.is_some() ||
+        dirs::home_dir().map(|h| h.join(".config").join("rgb").join("config.toml").exists()).unwrap_or(false);
+
+    if !has_config {
+        return Ok(AppConfig::default());
+    }
+
     let mut builder = Config::builder();
 
     // Start with defaults

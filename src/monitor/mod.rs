@@ -49,7 +49,6 @@ pub enum FileEventKind {
     Create,
     Modify,
     Delete,
-    Rename,
 }
 
 pub struct ConflictDetector {
@@ -65,6 +64,16 @@ pub enum ConflictResolution {
 }
 
 impl FileTracker {
+    pub fn new_disabled() -> Self {
+        // Create a disabled file tracker that doesn't monitor anything
+        Self {
+            terminal_files: Arc::new(RwLock::new(HashMap::new())),
+            file_changes: Arc::new(RwLock::new(Vec::new())),
+            conflict_detector: Arc::new(ConflictDetector::new()),
+            monitor: Arc::new(RwLock::new(None)),
+        }
+    }
+
     pub fn new(project_dir: &Path) -> Result<Self> {
         let conflict_detector = Arc::new(ConflictDetector::new());
         let mut tracker = Self {
@@ -91,7 +100,6 @@ impl FileTracker {
                         EventKind::Create(_) => Some(FileEventKind::Create),
                         EventKind::Modify(_) => Some(FileEventKind::Modify),
                         EventKind::Remove(_) => Some(FileEventKind::Delete),
-                        EventKind::Rename(_) => Some(FileEventKind::Rename),
                         _ => None,
                     };
 
@@ -143,7 +151,6 @@ impl FileTracker {
                                 FileEventKind::Create => ChangeType::Created,
                                 FileEventKind::Modify => ChangeType::Modified,
                                 FileEventKind::Delete => ChangeType::Deleted,
-                                FileEventKind::Rename => ChangeType::Modified, // Simplified
                             },
                             timestamp: event.timestamp,
                         };
@@ -153,7 +160,8 @@ impl FileTracker {
                         // Keep only recent changes (last 1000)
                         if file_changes.read().len() > 1000 {
                             let mut changes = file_changes.write();
-                            changes.drain(0..changes.len() - 1000);
+                            let drain_count = changes.len().saturating_sub(1000);
+                            changes.drain(0..drain_count);
                         }
                     }
                 } else {

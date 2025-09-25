@@ -44,9 +44,22 @@ async fn main() -> Result<()> {
         EnvFilter::from_default_env()
     };
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .init();
+    // Check if we should log to file (for debugging without interfering with TUI)
+    if std::env::var("RGB_LOG_FILE").is_ok() {
+        let log_file = std::fs::File::create("rgb_debug.log").expect("Failed to create log file");
+        tracing_subscriber::fmt()
+            .with_writer(log_file)
+            .with_ansi(false)
+            .with_env_filter(filter)
+            .init();
+
+        // Log that we're using file logging
+        tracing::info!("RGB starting with file logging to rgb_debug.log");
+    } else {
+        tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .init();
+    }
 
     // Load configuration
     let config = config::load_config(args.config)?;
@@ -57,14 +70,24 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("."));
 
     // Create and run the application
-    let mut app = app::RgbApp::new(config, project_dir)?;
+    match app::RgbApp::new(config, project_dir) {
+        Ok(mut app) => {
+            // If execute command is provided, create initial terminal with it
+            if let Some(cmd) = args.execute {
+                app.create_terminal_with_command(&cmd).await?;
+            }
 
-    // If execute command is provided, create initial terminal with it
-    if let Some(cmd) = args.execute {
-        app.create_terminal_with_command(&cmd).await?;
+            app.run().await?;
+        }
+        Err(e) => {
+            eprintln!("Failed to initialize RGB: {}", e);
+            eprintln!("\nCommon issues:");
+            eprintln!("- Make sure you're running in a real terminal (not in an IDE terminal)");
+            eprintln!("- Try running with: TERM=xterm-256color ./target/debug/rgb");
+            eprintln!("- On macOS, you may need to run in Terminal.app or iTerm2");
+            return Err(e);
+        }
     }
-
-    app.run().await?;
 
     Ok(())
 }

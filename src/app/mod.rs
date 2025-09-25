@@ -12,7 +12,8 @@ use ratatui::{
     backend::CrosstermBackend,
     Terminal,
 };
-use std::{io, path::PathBuf, time::Duration};
+use std::{io, path::PathBuf};
+use std::time::Duration;
 use tokio::time;
 
 pub struct RgbApp {
@@ -35,17 +36,27 @@ pub enum AppState {
 
 impl RgbApp {
     pub fn new(config: AppConfig, project_dir: PathBuf) -> Result<Self> {
+        tracing::info!("RgbApp::new called with project_dir: {:?}", project_dir);
+
         // Setup terminal
         enable_raw_mode()?;
+        tracing::info!("Raw mode enabled");
+
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen)?;
+        tracing::info!("Entered alternate screen");
+
         let backend = CrosstermBackend::new(stdout);
         let terminal = Terminal::new(backend)?;
+        tracing::info!("Terminal created");
 
         // Initialize components
         let workspace = WorkspaceManager::new(project_dir.clone())?;
+        tracing::info!("WorkspaceManager created");
+
         let layout = LayoutEngine::new();
         let ui = Ui::new();
+        tracing::info!("Layout and UI created");
 
         Ok(Self {
             workspace,
@@ -64,37 +75,91 @@ impl RgbApp {
     }
 
     pub async fn run(&mut self) -> Result<()> {
+        tracing::info!("App::run started");
+
         // Create initial terminal if workspace is empty
         if self.workspace.terminals().is_empty() {
+            tracing::info!("Creating initial terminal");
             self.workspace.create_terminal(None).await?;
         }
 
-        let mut tick_rate = time::interval(Duration::from_millis(100));
+        tracing::info!("Starting simplified main loop");
 
+        // Do an initial update to get terminal content
+        tracing::info!("Doing initial workspace update");
+        match self.workspace.update().await {
+            Ok(_) => tracing::info!("Initial workspace update complete"),
+            Err(e) => tracing::error!("Initial workspace update error: {}", e),
+        }
+
+        // Add a small delay to let terminal initialize
+        tracing::info!("Waiting for terminal to initialize");
+        // Use std::thread::sleep instead of tokio::time::sleep to avoid potential async issues
+        std::thread::sleep(Duration::from_millis(100));
+        tracing::info!("Starting main loop");
+
+        // Simplified loop - just draw and handle events
         loop {
-            // Draw UI
-            self.terminal.draw(|frame| {
-                self.ui.draw(frame, &self.workspace, &self.layout, &self.state);
-            })?;
+            tracing::info!("Loop iteration");
 
-            // Handle events
-            tokio::select! {
-                _ = tick_rate.tick() => {
-                    // Update workspace state
-                    self.workspace.update().await?;
-                }
-                _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                    if event::poll(Duration::from_millis(0))? {
-                        if let Event::Key(key) = event::read()? {
-                            self.handle_key_event(key).await?;
-                        }
-                    }
-                }
-            }
-
+            // Check if we should quit
             if self.should_quit {
+                tracing::info!("Quit flag set, exiting loop");
                 break;
             }
+
+            // Update terminals FIRST (non-blocking)
+            match self.workspace.update().await {
+                Ok(_) => {},
+                Err(e) => tracing::error!("Workspace update error: {}", e),
+            }
+
+            // Then draw UI
+            tracing::info!("About to draw UI");
+            match self.terminal.draw(|frame| {
+                tracing::info!("In draw callback, frame size: {:?}", frame.area());
+
+                // Draw something simple first
+                let size = frame.area();
+                let block = ratatui::widgets::Block::default()
+                    .title("RGB Terminal - Press Ctrl+Q to quit")
+                    .borders(ratatui::widgets::Borders::ALL);
+                frame.render_widget(block, size);
+
+                // Now draw the actual UI
+                self.ui.draw(frame, &self.workspace, &mut self.layout, &self.state);
+
+                tracing::info!("Draw callback complete");
+            }) {
+                Ok(_) => tracing::info!("Draw succeeded"),
+                Err(e) => tracing::error!("Draw failed: {}", e),
+            }
+
+            // Handle events
+            if event::poll(Duration::from_millis(50))? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        tracing::info!("Key event - Code: {:?}, Modifiers: {:?}, State: {:?}",
+                            key.code, key.modifiers, self.state);
+
+                        // Handle the key event (which includes global quit handling)
+                        self.handle_key_event(key).await?;
+
+                        // Force an update after key events to catch terminal responses
+                        match self.workspace.update().await {
+                            Ok(_) => {},
+                            Err(e) => tracing::error!("Workspace update error after key: {}", e),
+                        }
+                    }
+                    Event::Resize(width, height) => {
+                        tracing::info!("Terminal resized to {}x{}", width, height);
+                    }
+                    _ => {}
+                }
+            }
+
+            // Small delay
+            std::thread::sleep(Duration::from_millis(50));
         }
 
         self.cleanup()?;
@@ -102,6 +167,7 @@ impl RgbApp {
     }
 
     async fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
+        tracing::info!("Handling key {:?} in state {:?}", key, self.state);
         match self.state {
             AppState::Normal => self.handle_normal_mode(key).await?,
             AppState::Insert => self.handle_insert_mode(key).await?,
@@ -114,15 +180,15 @@ impl RgbApp {
     async fn handle_normal_mode(&mut self, key: KeyEvent) -> Result<()> {
         match (key.code, key.modifiers) {
             // Quit
-            (KeyCode::Char('q'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('q') | KeyCode::Char('Q'), KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
             // New terminal
-            (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('t') | KeyCode::Char('T'), KeyModifiers::CONTROL) => {
                 self.workspace.create_terminal(None).await?;
             }
             // Close terminal
-            (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
+            (KeyCode::Char('w') | KeyCode::Char('W'), KeyModifiers::CONTROL) => {
                 self.workspace.close_active_terminal().await?;
                 if self.workspace.terminals().is_empty() {
                     self.should_quit = true;
@@ -143,6 +209,7 @@ impl RgbApp {
             }
             // Mode switching
             (KeyCode::Char('i'), KeyModifiers::NONE) => {
+                tracing::info!("Switching to Insert mode");
                 self.state = AppState::Insert;
             }
             (KeyCode::Char(':'), KeyModifiers::NONE) => {
@@ -150,6 +217,14 @@ impl RgbApp {
             }
             (KeyCode::Char('v'), KeyModifiers::NONE) => {
                 self.state = AppState::Visual;
+            }
+            // Toggle file explorer
+            (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
+                self.ui.toggle_file_explorer();
+            }
+            // Toggle git panel
+            (KeyCode::Char('g'), KeyModifiers::CONTROL) => {
+                self.ui.toggle_git_panel();
             }
             // Tab switching
             (KeyCode::Tab, KeyModifiers::NONE) => {
@@ -168,12 +243,48 @@ impl RgbApp {
     }
 
     async fn handle_insert_mode(&mut self, key: KeyEvent) -> Result<()> {
+        tracing::info!("Insert mode handling key: {:?}, modifiers bits: {:b}", key, key.modifiers.bits());
+
+        // Check for Ctrl combinations first (they take priority)
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            tracing::info!("Ctrl modifier detected");
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Char('Q') => {
+                    tracing::info!("Ctrl+Q in Insert mode - quitting");
+                    self.should_quit = true;
+                    return Ok(());
+                }
+                KeyCode::Char('t') | KeyCode::Char('T') => {
+                    tracing::info!("Ctrl+T in Insert mode - creating new terminal");
+                    self.workspace.create_terminal(None).await?;
+                    return Ok(());
+                }
+                KeyCode::Char('w') | KeyCode::Char('W') => {
+                    tracing::info!("Ctrl+W in Insert mode - closing terminal");
+                    self.workspace.close_active_terminal().await?;
+                    if self.workspace.terminals().is_empty() {
+                        self.should_quit = true;
+                    }
+                    return Ok(());
+                }
+                _ => {
+                    // Forward other Ctrl combinations to terminal
+                    tracing::info!("Forwarding Ctrl key to terminal: {:?}", key);
+                    self.workspace.send_key_to_active_terminal(key).await?;
+                    return Ok(());
+                }
+            }
+        }
+
+        // Now check for special keys
         match key.code {
             KeyCode::Esc => {
+                tracing::info!("ESC detected - switching back to Normal mode");
                 self.state = AppState::Normal;
             }
             _ => {
-                // Forward key to active terminal
+                // Forward regular keys to terminal
+                tracing::info!("Forwarding key to terminal: {:?}", key);
                 self.workspace.send_key_to_active_terminal(key).await?;
             }
         }

@@ -1,20 +1,41 @@
 use anyhow::Result;
 use crossterm::event::KeyEvent;
-use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
-use std::io::{Read, Write};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use std::io::{Read, Write, ErrorKind};
 use std::path::Path;
-use std::sync::Arc;
-use tokio::sync::Mutex;
 use vte::{Params, Parser, Perform};
+
+// For setting non-blocking mode on Unix
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 pub struct TerminalEmulator {
     master: Box<dyn MasterPty + Send>,
-    parser: Parser,
+    writer: Box<dyn Write + Send>,
+    _child: Box<dyn Child + Send>,  // Keep the child process alive
     size: (u16, u16),
     output_buffer: Vec<u8>,
     display_buffer: Vec<Vec<char>>,
     cursor_pos: (u16, u16),
     active_files: Vec<String>,
+    has_pending_input: bool,  // Track if we've sent input that needs reading
+}
+
+// Helper function to set non-blocking mode on a file descriptor
+#[cfg(unix)]
+fn set_nonblocking(fd: std::os::unix::io::RawFd) -> Result<()> {
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL, 0);
+        if flags < 0 {
+            return Err(anyhow::anyhow!("Failed to get file descriptor flags"));
+        }
+
+        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return Err(anyhow::anyhow!("Failed to set non-blocking mode"));
+        }
+    }
+
+    Ok(())
 }
 
 impl TerminalEmulator {
@@ -29,12 +50,27 @@ impl TerminalEmulator {
 
         let pair = pty_system.openpty(pty_size)?;
 
+        // Set the PTY to non-blocking mode
+        #[cfg(unix)]
+        if let Some(fd) = pair.master.as_raw_fd() {
+            if let Err(e) = set_nonblocking(fd) {
+                tracing::warn!("Failed to set PTY to non-blocking mode: {}", e);
+            } else {
+                tracing::info!("PTY set to non-blocking mode");
+            }
+        }
+
         let mut cmd = CommandBuilder::new(command);
         cmd.cwd(working_dir);
         cmd.env("TERM", "xterm-256color");
         cmd.env("COLORTERM", "truecolor");
 
-        let _child = pair.slave.spawn_command(cmd)?;
+        // For shells, don't add -i flag here, let the shell decide
+        // The shell will detect it's connected to a TTY and become interactive
+
+        let child = pair.slave.spawn_command(cmd)?;
+
+        tracing::info!("Terminal created with command: {} in dir: {:?}", command, working_dir);
 
         // Initialize display buffer
         let mut display_buffer = Vec::with_capacity(size.1 as usize);
@@ -42,23 +78,40 @@ impl TerminalEmulator {
             display_buffer.push(vec![' '; size.0 as usize]);
         }
 
-        Ok(TerminalEmulator {
+        let writer = pair.master.take_writer()?;
+
+        let emulator = TerminalEmulator {
             master: pair.master,
-            parser: Parser::new(),
+            writer,
+            _child: child,  // Keep the child process alive
             size,
             output_buffer: Vec::new(),
             display_buffer,
             cursor_pos: (0, 0),
             active_files: Vec::new(),
-        })
+            has_pending_input: false,
+        };
+
+        Ok(emulator)
     }
 
     pub fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.master.take_writer()?.write_all(data)?;
+        tracing::debug!("Writing {} bytes to terminal: {:?}", data.len(), String::from_utf8_lossy(data));
+        self.writer.write_all(data)?;
+        self.writer.flush()?;
+        self.has_pending_input = true;  // Mark that we need to read output
+        // Don't call update() here to avoid potential recursion
         Ok(())
     }
 
     pub fn resize(&mut self, size: (u16, u16)) -> Result<()> {
+        // Only resize if size actually changed
+        if self.size == size {
+            return Ok(());
+        }
+
+        tracing::debug!("Resizing terminal from {:?} to {:?}", self.size, size);
+
         self.size = size;
         let pty_size = PtySize {
             rows: size.1,
@@ -68,35 +121,159 @@ impl TerminalEmulator {
         };
         self.master.resize(pty_size)?;
 
-        // Resize display buffer
-        self.display_buffer.clear();
-        for _ in 0..size.1 {
-            self.display_buffer.push(vec![' '; size.0 as usize]);
+        // Resize display buffer, preserving existing content where possible
+        let old_buffer = std::mem::take(&mut self.display_buffer);
+        self.display_buffer = Vec::with_capacity(size.1 as usize);
+
+        for y in 0..size.1 as usize {
+            let mut new_line = vec![' '; size.0 as usize];
+
+            // Copy over existing content if available
+            if y < old_buffer.len() {
+                let old_line = &old_buffer[y];
+                for x in 0..std::cmp::min(size.0 as usize, old_line.len()) {
+                    new_line[x] = old_line[x];
+                }
+            }
+
+            self.display_buffer.push(new_line);
         }
+
+        // Adjust cursor position if needed
+        self.cursor_pos.0 = self.cursor_pos.0.min(size.0 - 1);
+        self.cursor_pos.1 = self.cursor_pos.1.min(size.1 - 1);
 
         Ok(())
     }
 
     pub fn update(&mut self) -> Result<()> {
-        let mut reader = self.master.try_clone_reader()?;
-        reader.set_non_blocking(true)?;
+        tracing::trace!("Terminal::update called, has_pending_input: {}", self.has_pending_input);
 
         let mut buffer = [0u8; 4096];
-        match reader.read(&mut buffer) {
-            Ok(n) if n > 0 => {
-                self.output_buffer.extend_from_slice(&buffer[..n]);
+        let mut total_read = 0;
 
-                // Process through VTE parser
-                for byte in &buffer[..n] {
-                    self.parser.advance(self, *byte);
-                }
-
-                // Parse for file references
-                self.parse_for_files(&buffer[..n]);
+        tracing::debug!("Attempting to clone reader");
+        let mut reader = match self.master.try_clone_reader() {
+            Ok(r) => {
+                tracing::debug!("Successfully cloned reader");
+                r
+            },
+            Err(e) => {
+                tracing::error!("Failed to clone reader: {}", e);
+                return Err(anyhow::anyhow!("Failed to clone reader: {}", e));
             }
-            Ok(_) | Err(_) => {}
+        };
+
+        // If we're expecting output (just sent input), do more iterations
+        // Otherwise just do 1 iteration to check for any async output
+        let max_iterations = if self.has_pending_input {
+            tracing::debug!("Has pending input, will do up to 10 read iterations");
+            10  // More iterations when we expect output
+        } else if self.output_buffer.is_empty() {
+            tracing::debug!("Empty buffer, will do up to 10 read iterations");
+            10  // First time, read more
+        } else {
+            tracing::trace!("No pending input, will do 1 read iteration");
+            1   // Just check once for async output
+        };
+
+        if self.has_pending_input {
+            self.has_pending_input = false;
+        }
+        let mut iterations = 0;
+
+        // Read all available data (with a limit to prevent infinite loops)
+        tracing::debug!("Starting read loop with max {} iterations", max_iterations);
+
+        // First, do a single read to see if there's any data
+        let mut has_data = false;
+
+        loop {
+            iterations += 1;
+            if iterations > max_iterations {
+                tracing::debug!("Reached max read iterations ({}), stopping", max_iterations);
+                break;
+            }
+
+            tracing::trace!("Read iteration {}", iterations);
+
+            // After 6 successful reads in any update, stop
+            if iterations > 6 && has_data {
+                tracing::debug!("Stopping after {} reads to avoid blocking", iterations - 1);
+                break;
+            }
+
+            match reader.read(&mut buffer) {
+                Ok(0) => {
+                    // EOF
+                    tracing::debug!("Read returned 0 bytes (EOF)");
+                    if total_read == 0 && iterations == 1 && self.has_pending_input {
+                        // Give it one more try with a very small delay
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                        continue;
+                    }
+                    if total_read == 0 {
+                        tracing::trace!("No data from PTY (EOF)");
+                    }
+                    break;
+                }
+                Ok(n) => {
+                    tracing::debug!("Read {} bytes on iteration {}", n, iterations);
+                    has_data = true;
+                    total_read += n;
+                    self.output_buffer.extend_from_slice(&buffer[..n]);
+
+                    // Only log in trace mode to avoid spam
+                    if tracing::enabled!(tracing::Level::TRACE) {
+                        let text = String::from_utf8_lossy(&buffer[..n]);
+                        tracing::trace!("Read {} bytes: {:?}", n, text);
+                    }
+
+                    // Log first few bytes for debugging
+                    let preview = &buffer[..n.min(50)];
+                    let preview_str = String::from_utf8_lossy(preview);
+                    tracing::debug!("Read data preview ({}b): {:?}", n, preview_str);
+
+                    // Parse for file references first
+                    self.parse_for_files(&buffer[..n]);
+
+                    // Process through VTE parser
+                    let mut parser = Parser::new();
+                    for byte in &buffer[..n] {
+                        parser.advance(self, *byte);
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
+                    // No more data available (non-blocking read)
+                    tracing::trace!("Got WouldBlock on iteration {}", iterations);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!("PTY read error on iteration {}: {}", iterations, e);
+                    break;
+                }
+            }
         }
 
+        // Only log buffer state once at the end if we read something
+        if total_read > 0 && tracing::enabled!(tracing::Level::DEBUG) {
+            let non_empty_lines: Vec<_> = self.display_buffer.iter()
+                .enumerate()
+                .filter(|(_, line)| line.iter().any(|&c| c != ' '))
+                .take(3)
+                .map(|(i, line)| (i + 1, line.iter().collect::<String>()))
+                .collect();
+
+            if !non_empty_lines.is_empty() {
+                tracing::debug!("Terminal has {} lines of content", non_empty_lines.len());
+            }
+        }
+
+        if total_read > 0 {
+            tracing::debug!("Total read: {} bytes, cursor at {:?}", total_read, self.cursor_pos);
+        }
+
+        tracing::debug!("Terminal update complete, read {} total bytes", total_read);
         Ok(())
     }
 
@@ -125,18 +302,38 @@ impl TerminalEmulator {
     }
 
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
+        tracing::debug!("Handling key event: {:?}", key);
         let bytes = convert_key_to_bytes(key);
         if !bytes.is_empty() {
+            tracing::debug!("Converted to {} bytes: {:?}", bytes.len(), bytes);
             self.write(&bytes)?;
+        } else {
+            tracing::debug!("Key event produced no bytes: {:?}", key);
         }
         Ok(())
     }
 
     pub fn get_visible_content(&self) -> Vec<String> {
-        self.display_buffer
+        let content: Vec<String> = self.display_buffer
             .iter()
             .map(|line| line.iter().collect::<String>())
-            .collect()
+            .collect();
+
+        // Debug log non-empty lines
+        let non_empty_count = content.iter().filter(|line| !line.trim().is_empty()).count();
+        if non_empty_count > 0 {
+            tracing::trace!("Display buffer has {} non-empty lines out of {}", non_empty_count, content.len());
+
+            // Log line 4 specifically if it exists
+            if content.len() > 4 {
+                let line4 = &content[4];
+                if !line4.trim().is_empty() {
+                    tracing::debug!("Line 4 content (len {}): {:?}", line4.len(), line4);
+                }
+            }
+        }
+
+        content
     }
 
     pub fn get_cursor_position(&self) -> (u16, u16) {
@@ -156,9 +353,24 @@ impl TerminalEmulator {
 impl Perform for TerminalEmulator {
     fn print(&mut self, c: char) {
         let (x, y) = self.cursor_pos;
+        tracing::debug!("VTE print '{}' at cursor ({}, {}), buffer size ({} x {})",
+            c, x, y, self.size.0, self.size.1);
+
         if (y as usize) < self.display_buffer.len() && (x as usize) < self.display_buffer[y as usize].len() {
             self.display_buffer[y as usize][x as usize] = c;
-            self.cursor_pos.0 = (x + 1).min(self.size.0 - 1);
+            self.cursor_pos.0 = x + 1;
+
+            // Handle line wrap
+            if self.cursor_pos.0 >= self.size.0 {
+                self.cursor_pos.0 = 0;
+                self.cursor_pos.1 = (self.cursor_pos.1 + 1).min(self.size.1 - 1);
+            }
+
+            tracing::debug!("Updated buffer at ({}, {}), new cursor at ({}, {})",
+                x, y, self.cursor_pos.0, self.cursor_pos.1);
+        } else {
+            tracing::warn!("Print out of bounds: cursor ({}, {}) for buffer size ({} x {})",
+                x, y, self.display_buffer[0].len(), self.display_buffer.len());
         }
     }
 
@@ -207,33 +419,36 @@ impl Perform for TerminalEmulator {
         match c {
             'H' | 'f' => {
                 // Cursor position
-                let row = params.iter().next().and_then(|p| p[0]).unwrap_or(1) as u16;
-                let col = params.iter().nth(1).and_then(|p| p[0]).unwrap_or(1) as u16;
-                self.cursor_pos = (col.saturating_sub(1), row.saturating_sub(1));
+                let row = *params.iter().next().and_then(|p| p.first()).unwrap_or(&1) as u16;
+                let col = *params.iter().nth(1).and_then(|p| p.first()).unwrap_or(&1) as u16;
+                let new_pos = (col.saturating_sub(1), row.saturating_sub(1));
+                tracing::debug!("CSI cursor position: row={}, col={}, setting cursor to {:?}",
+                    row, col, new_pos);
+                self.cursor_pos = new_pos;
             }
             'A' => {
                 // Cursor up
-                let n = params.iter().next().and_then(|p| p[0]).unwrap_or(1) as u16;
+                let n = *params.iter().next().and_then(|p| p.first()).unwrap_or(&1) as u16;
                 self.cursor_pos.1 = self.cursor_pos.1.saturating_sub(n);
             }
             'B' => {
                 // Cursor down
-                let n = params.iter().next().and_then(|p| p[0]).unwrap_or(1) as u16;
+                let n = *params.iter().next().and_then(|p| p.first()).unwrap_or(&1) as u16;
                 self.cursor_pos.1 = (self.cursor_pos.1 + n).min(self.size.1 - 1);
             }
             'C' => {
                 // Cursor forward
-                let n = params.iter().next().and_then(|p| p[0]).unwrap_or(1) as u16;
+                let n = *params.iter().next().and_then(|p| p.first()).unwrap_or(&1) as u16;
                 self.cursor_pos.0 = (self.cursor_pos.0 + n).min(self.size.0 - 1);
             }
             'D' => {
                 // Cursor backward
-                let n = params.iter().next().and_then(|p| p[0]).unwrap_or(1) as u16;
+                let n = *params.iter().next().and_then(|p| p.first()).unwrap_or(&1) as u16;
                 self.cursor_pos.0 = self.cursor_pos.0.saturating_sub(n);
             }
             'J' => {
                 // Clear screen
-                let mode = params.iter().next().and_then(|p| p[0]).unwrap_or(0);
+                let mode = *params.iter().next().and_then(|p| p.first()).unwrap_or(&0);
                 match mode {
                     0 => {
                         // Clear from cursor to end
@@ -245,6 +460,18 @@ impl Perform for TerminalEmulator {
                             }
                         }
                     }
+                    1 => {
+                        // Clear from beginning to cursor
+                        let (x, y) = self.cursor_pos;
+                        for row in 0..=y as usize {
+                            let end = if row == y as usize { x as usize + 1 } else { self.display_buffer[row].len() };
+                            for col in 0..end {
+                                if row < self.display_buffer.len() && col < self.display_buffer[row].len() {
+                                    self.display_buffer[row][col] = ' ';
+                                }
+                            }
+                        }
+                    }
                     2 => {
                         // Clear entire screen
                         for row in &mut self.display_buffer {
@@ -252,13 +479,16 @@ impl Perform for TerminalEmulator {
                                 *col = ' ';
                             }
                         }
+                        // Reset cursor to top-left
+                        self.cursor_pos = (0, 0);
                     }
                     _ => {}
                 }
+                tracing::trace!("Clear screen mode {}", mode);
             }
             'K' => {
                 // Clear line
-                let mode = params.iter().next().and_then(|p| p[0]).unwrap_or(0);
+                let mode = *params.iter().next().and_then(|p| p.first()).unwrap_or(&0);
                 let y = self.cursor_pos.1 as usize;
                 if y < self.display_buffer.len() {
                     match mode {

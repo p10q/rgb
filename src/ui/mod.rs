@@ -27,8 +27,8 @@ impl Ui {
             command_buffer: String::new(),
             error_message: None,
             show_help: false,
-            show_git_panel: true,
-            show_file_explorer: true,
+            show_git_panel: false,  // Hidden by default to save space
+            show_file_explorer: true,  // Shown by default
         }
     }
 
@@ -36,10 +36,12 @@ impl Ui {
         &self,
         frame: &mut Frame,
         workspace: &WorkspaceManager,
-        layout: &LayoutEngine,
+        layout: &mut LayoutEngine,
         state: &AppState,
     ) {
+        tracing::info!("UI::draw called");
         let size = frame.area();
+        tracing::info!("Frame area: {:?}", size);
 
         // Main layout: header, body, footer
         let chunks = Layout::default()
@@ -151,24 +153,35 @@ impl Ui {
         frame: &mut Frame,
         area: Rect,
         workspace: &WorkspaceManager,
-        layout: &LayoutEngine,
+        layout: &mut LayoutEngine,
     ) {
+        tracing::info!("draw_terminals called with area: {:?}", area);
+
         let terminals = workspace.terminals();
+        tracing::info!("Found {} terminals", terminals.len());
+
         let terminal_ids: Vec<TerminalId> = terminals.iter().map(|t| t.id).collect();
 
         // Calculate layout for terminals
         let terminal_rects = layout.calculate_layout(area, &terminal_ids);
+        tracing::info!("Layout calculated {} rectangles", terminal_rects.len());
 
         // Draw each terminal
         for (terminal_id, rect) in terminal_rects {
+            tracing::info!("Drawing terminal {:?} in rect {:?}", terminal_id, rect);
+
             if let Some(emulator) = workspace.get_terminal_emulator(terminal_id) {
                 let is_active = workspace.active_terminal_id() == Some(terminal_id);
+                tracing::info!("Terminal is_active: {}", is_active);
 
                 // Create terminal widget
                 let terminal_widget = widgets::TerminalWidget::new(emulator.clone())
                     .active(is_active);
 
                 frame.render_widget(terminal_widget, rect);
+                tracing::info!("Widget rendered for terminal {:?}", terminal_id);
+            } else {
+                tracing::warn!("No emulator found for terminal {:?}", terminal_id);
             }
         }
     }

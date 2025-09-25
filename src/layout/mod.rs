@@ -74,9 +74,9 @@ impl LayoutEngine {
             return self.terminal_positions.clone();
         }
 
-        match &self.mode {
+        match self.mode.clone() {
             LayoutMode::Tiled(tile_layout) => {
-                self.calculate_tiled_layout(area, terminals, tile_layout)
+                self.calculate_tiled_layout(area, terminals, &tile_layout)
             }
             LayoutMode::Floating => self.calculate_floating_layout(area, terminals),
             LayoutMode::Tabbed => self.calculate_tabbed_layout(area, terminals),
