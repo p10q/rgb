@@ -14,7 +14,7 @@ use ratatui::{
 };
 use std::{io, path::PathBuf};
 use std::time::Duration;
-use tokio::time;
+use tokio::sync::mpsc;
 
 pub struct RgbApp {
     workspace: WorkspaceManager,
@@ -92,76 +92,63 @@ impl RgbApp {
             Err(e) => tracing::error!("Initial workspace update error: {}", e),
         }
 
-        // Force initial update with a small yield to ensure terminal is ready
-        tokio::task::yield_now().await;
+        // Create channel for redraw signals
+        let (redraw_tx, mut redraw_rx) = mpsc::unbounded_channel::<()>();
 
-        // Optimized main loop
-        let mut needs_redraw = true;
-        let mut last_update = std::time::Instant::now();
+        // Give workspace a way to signal redraws
+        self.workspace.set_redraw_sender(redraw_tx.clone());
+
+        // Initial draw
+        self.draw_ui();
+
+        // Event-driven main loop with continuous terminal monitoring
+        let mut update_interval = tokio::time::interval(Duration::from_millis(5));
+        update_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            // Check if we should quit
             if self.should_quit {
                 tracing::debug!("Quit flag set, exiting loop");
                 break;
             }
 
-            // Only update terminals periodically or when needed
-            let now = std::time::Instant::now();
-            if needs_redraw || now.duration_since(last_update) > Duration::from_millis(16) {
-                match self.workspace.update().await {
-                    Ok(_) => {},
-                    Err(e) => tracing::error!("Workspace update error: {}", e),
-                }
-                last_update = now;
-            }
-
-            // Draw UI only when needed
-            if needs_redraw {
-                match self.terminal.draw(|frame| {
-                    tracing::trace!("Drawing frame");
-
-                    // Draw something simple first
-                    let size = frame.area();
-                    let block = ratatui::widgets::Block::default()
-                        .title("RGB Terminal - Press Ctrl+Q to quit")
-                        .borders(ratatui::widgets::Borders::ALL);
-                    frame.render_widget(block, size);
-
-                    // Now draw the actual UI
-                    self.ui.draw(frame, &self.workspace, &mut self.layout, &self.state);
-                }) {
-                    Ok(_) => {},
-                    Err(e) => tracing::error!("Draw failed: {}", e),
-                }
-                needs_redraw = false;
-            }
-
-            // Handle events with minimal blocking
-            if event::poll(Duration::from_millis(1))? {
-                match event::read()? {
-                    Event::Key(key) => {
-                        tracing::debug!("Key event: {:?}", key.code);
-
-                        // Handle the key event
-                        self.handle_key_event(key).await?;
-
-                        // Mark for redraw after input
-                        needs_redraw = true;
+            tokio::select! {
+                // Continuous terminal output monitoring
+                _ = update_interval.tick() => {
+                    // Update terminal buffers
+                    match self.workspace.update().await {
+                        Ok(_) => {
+                            // Workspace update will signal redraw if needed
+                        },
+                        Err(e) => tracing::error!("Workspace update error: {}", e),
                     }
-                    Event::Resize(width, height) => {
-                        tracing::debug!("Terminal resized to {}x{}", width, height);
-                        needs_redraw = true;
-                    }
-                    _ => {}
                 }
-            } else {
-                // Small yield to prevent busy-waiting
-                tokio::task::yield_now().await;
-            }
 
-            // Small delay
-            std::thread::sleep(Duration::from_millis(50));
+                // Handle explicit redraw signals
+                _ = redraw_rx.recv() => {
+                    tracing::trace!("Redraw signal received");
+                    self.draw_ui();
+                }
+
+                // Handle keyboard/mouse events
+                _ = tokio::time::sleep(Duration::from_millis(1)) => {
+                    if event::poll(Duration::from_millis(0))? {
+                        match event::read()? {
+                            Event::Key(key) => {
+                                tracing::debug!("Key event: {:?}", key.code);
+                                self.handle_key_event(key).await?;
+
+                                // Immediate redraw after input
+                                self.draw_ui();
+                            }
+                            Event::Resize(width, height) => {
+                                tracing::debug!("Terminal resized to {}x{}", width, height);
+                                self.draw_ui();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
 
         self.cleanup()?;
@@ -177,6 +164,23 @@ impl RgbApp {
             AppState::Visual => self.handle_visual_mode(key).await?,
         }
         Ok(())
+    }
+
+    fn draw_ui(&mut self) {
+        match self.terminal.draw(|frame| {
+            tracing::trace!("Drawing frame");
+
+            let size = frame.area();
+            let block = ratatui::widgets::Block::default()
+                .title("RGB Terminal - Press Ctrl+Q to quit")
+                .borders(ratatui::widgets::Borders::ALL);
+            frame.render_widget(block, size);
+
+            self.ui.draw(frame, &self.workspace, &mut self.layout, &self.state);
+        }) {
+            Ok(_) => {},
+            Err(e) => tracing::error!("Draw failed: {}", e),
+        }
     }
 
     async fn handle_normal_mode(&mut self, key: KeyEvent) -> Result<()> {

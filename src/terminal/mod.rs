@@ -150,7 +150,7 @@ impl TerminalEmulator {
         Ok(())
     }
 
-    pub fn update(&mut self) -> Result<()> {
+    pub fn update(&mut self) -> Result<bool> {  // Returns true if there was output
         tracing::trace!("Terminal::update called, has_pending_input: {}", self.has_pending_input);
 
         let mut buffer = [0u8; 4096];
@@ -279,7 +279,7 @@ impl TerminalEmulator {
         }
 
         tracing::debug!("Terminal update complete, read {} total bytes", total_read);
-        Ok(())
+        Ok(total_read > 0)
     }
 
     fn parse_for_files(&mut self, data: &[u8]) {

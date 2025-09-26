@@ -7,6 +7,7 @@ use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 pub type TerminalId = Uuid;
@@ -18,6 +19,7 @@ pub struct WorkspaceManager {
     git_manager: Arc<GitManager>,
     file_tracker: Arc<FileTracker>,
     max_terminals: usize,
+    redraw_tx: Arc<RwLock<Option<mpsc::UnboundedSender<()>>>>,
 }
 
 pub struct TerminalSession {
@@ -43,6 +45,7 @@ impl WorkspaceManager {
             git_manager,
             file_tracker,
             max_terminals: 10,
+            redraw_tx: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -79,10 +82,13 @@ impl WorkspaceManager {
         // Send a carriage return to trigger shell prompt display
         emulator.write(b"\r").ok();
 
+        // Create Arc for the emulator
+        let emulator_arc = Arc::new(RwLock::new(emulator));
+
         let session = TerminalSession {
             id,
             title,
-            emulator: Arc::new(RwLock::new(emulator)),
+            emulator: emulator_arc,
             working_dir,
             active_files: HashSet::new(),
             worktree_path,
@@ -203,6 +209,16 @@ impl WorkspaceManager {
         }
     }
 
+    pub fn set_redraw_sender(&self, tx: mpsc::UnboundedSender<()>) {
+        *self.redraw_tx.write() = Some(tx);
+    }
+
+    fn signal_redraw(&self) {
+        if let Some(ref tx) = *self.redraw_tx.read() {
+            let _ = tx.send(());
+        }
+    }
+
     pub async fn send_key_to_active_terminal(&self, key: KeyEvent) -> Result<()> {
         let active_id = self.active_terminal.read().clone();
         if let Some(id) = active_id {
@@ -215,38 +231,36 @@ impl WorkspaceManager {
     }
 
     pub async fn update(&self) -> Result<()> {
-        tracing::debug!("WorkspaceManager::update start");
+        tracing::trace!("WorkspaceManager::update start");
 
         // Update all terminal emulators to read their output
         let terminals = self.terminals.read();
-        tracing::debug!("Found {} terminals to update", terminals.len());
+        let mut had_output = false;
 
-        for (idx, terminal) in terminals.iter().enumerate() {
-            tracing::debug!("Attempting to update terminal {}", idx);
-
+        for terminal in terminals.iter() {
             // Use is_some() first to avoid any potential blocking
             if terminal.emulator.try_write().is_some() {
                 // Now get the lock
                 if let Some(mut emulator) = terminal.emulator.try_write() {
-                    tracing::debug!("Got write lock for terminal {}", idx);
                     match emulator.update() {
-                        Ok(_) => {
-                            tracing::debug!("Terminal {} updated successfully", idx);
+                        Ok(has_output) => {
+                            if has_output {
+                                had_output = true;
+                            }
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to update terminal {}: {}", idx, e);
+                            tracing::warn!("Failed to update terminal: {}", e);
                         }
                     }
-                } else {
-                    tracing::warn!("Lock disappeared for terminal {}", idx);
                 }
-            } else {
-                tracing::debug!("Terminal {} is locked, skipping update", idx);
             }
-
-            tracing::debug!("Finished processing terminal {}", idx);
         }
         drop(terminals); // Explicitly drop the read lock
+
+        // Signal redraw if we had output
+        if had_output {
+            self.signal_redraw();
+        }
         tracing::debug!("All terminal emulators updated");
 
         // Skip file tracking for now - might be blocking
