@@ -56,7 +56,7 @@ impl TerminalEmulator {
             if let Err(e) = set_nonblocking(fd) {
                 tracing::warn!("Failed to set PTY to non-blocking mode: {}", e);
             } else {
-                tracing::info!("PTY set to non-blocking mode");
+                tracing::debug!("PTY set to non-blocking mode");
             }
         }
 
@@ -100,7 +100,11 @@ impl TerminalEmulator {
         self.writer.write_all(data)?;
         self.writer.flush()?;
         self.has_pending_input = true;  // Mark that we need to read output
-        // Don't call update() here to avoid potential recursion
+
+        // In release builds, add a tiny yield to ensure PTY processes the input
+        #[cfg(not(debug_assertions))]
+        std::thread::yield_now();
+
         Ok(())
     }
 
@@ -237,9 +241,10 @@ impl TerminalEmulator {
                     // Parse for file references first
                     self.parse_for_files(&buffer[..n]);
 
-                    // Process through VTE parser
+                    // Process through VTE parser - batch processing
                     let mut parser = Parser::new();
-                    for byte in &buffer[..n] {
+                    let slice = &buffer[..n];
+                    for byte in slice {
                         parser.advance(self, *byte);
                     }
                 }

@@ -92,70 +92,72 @@ impl RgbApp {
             Err(e) => tracing::error!("Initial workspace update error: {}", e),
         }
 
-        // Add a small delay to let terminal initialize
-        tracing::info!("Waiting for terminal to initialize");
-        // Use std::thread::sleep instead of tokio::time::sleep to avoid potential async issues
-        std::thread::sleep(Duration::from_millis(100));
-        tracing::info!("Starting main loop");
+        // Force initial update with a small yield to ensure terminal is ready
+        tokio::task::yield_now().await;
 
-        // Simplified loop - just draw and handle events
+        // Optimized main loop
+        let mut needs_redraw = true;
+        let mut last_update = std::time::Instant::now();
+
         loop {
-            tracing::info!("Loop iteration");
-
             // Check if we should quit
             if self.should_quit {
-                tracing::info!("Quit flag set, exiting loop");
+                tracing::debug!("Quit flag set, exiting loop");
                 break;
             }
 
-            // Update terminals FIRST (non-blocking)
-            match self.workspace.update().await {
-                Ok(_) => {},
-                Err(e) => tracing::error!("Workspace update error: {}", e),
+            // Only update terminals periodically or when needed
+            let now = std::time::Instant::now();
+            if needs_redraw || now.duration_since(last_update) > Duration::from_millis(16) {
+                match self.workspace.update().await {
+                    Ok(_) => {},
+                    Err(e) => tracing::error!("Workspace update error: {}", e),
+                }
+                last_update = now;
             }
 
-            // Then draw UI
-            tracing::info!("About to draw UI");
-            match self.terminal.draw(|frame| {
-                tracing::info!("In draw callback, frame size: {:?}", frame.area());
+            // Draw UI only when needed
+            if needs_redraw {
+                match self.terminal.draw(|frame| {
+                    tracing::trace!("Drawing frame");
 
-                // Draw something simple first
-                let size = frame.area();
-                let block = ratatui::widgets::Block::default()
-                    .title("RGB Terminal - Press Ctrl+Q to quit")
-                    .borders(ratatui::widgets::Borders::ALL);
-                frame.render_widget(block, size);
+                    // Draw something simple first
+                    let size = frame.area();
+                    let block = ratatui::widgets::Block::default()
+                        .title("RGB Terminal - Press Ctrl+Q to quit")
+                        .borders(ratatui::widgets::Borders::ALL);
+                    frame.render_widget(block, size);
 
-                // Now draw the actual UI
-                self.ui.draw(frame, &self.workspace, &mut self.layout, &self.state);
-
-                tracing::info!("Draw callback complete");
-            }) {
-                Ok(_) => tracing::info!("Draw succeeded"),
-                Err(e) => tracing::error!("Draw failed: {}", e),
+                    // Now draw the actual UI
+                    self.ui.draw(frame, &self.workspace, &mut self.layout, &self.state);
+                }) {
+                    Ok(_) => {},
+                    Err(e) => tracing::error!("Draw failed: {}", e),
+                }
+                needs_redraw = false;
             }
 
-            // Handle events
-            if event::poll(Duration::from_millis(50))? {
+            // Handle events with minimal blocking
+            if event::poll(Duration::from_millis(1))? {
                 match event::read()? {
                     Event::Key(key) => {
-                        tracing::info!("Key event - Code: {:?}, Modifiers: {:?}, State: {:?}",
-                            key.code, key.modifiers, self.state);
+                        tracing::debug!("Key event: {:?}", key.code);
 
-                        // Handle the key event (which includes global quit handling)
+                        // Handle the key event
                         self.handle_key_event(key).await?;
 
-                        // Force an update after key events to catch terminal responses
-                        match self.workspace.update().await {
-                            Ok(_) => {},
-                            Err(e) => tracing::error!("Workspace update error after key: {}", e),
-                        }
+                        // Mark for redraw after input
+                        needs_redraw = true;
                     }
                     Event::Resize(width, height) => {
-                        tracing::info!("Terminal resized to {}x{}", width, height);
+                        tracing::debug!("Terminal resized to {}x{}", width, height);
+                        needs_redraw = true;
                     }
                     _ => {}
                 }
+            } else {
+                // Small yield to prevent busy-waiting
+                tokio::task::yield_now().await;
             }
 
             // Small delay
