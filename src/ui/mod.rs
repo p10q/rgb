@@ -12,6 +12,8 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, Paragraph, Tabs},
     Frame,
 };
+use std::fs;
+use std::path::Path;
 
 pub struct Ui {
     command_buffer: String,
@@ -19,17 +21,48 @@ pub struct Ui {
     show_help: bool,
     show_git_panel: bool,
     show_file_explorer: bool,
+    file_explorer_selected: usize,  // Index of selected item in file explorer
+    file_tree: Vec<FileTreeItem>,
+}
+
+#[derive(Clone, Debug)]
+struct FileTreeItem {
+    name: String,
+    is_dir: bool,
+    is_expanded: bool,
+    depth: usize,
+    path: String,
 }
 
 impl Ui {
     pub fn new() -> Self {
-        Self {
+        // Build initial file tree - start with root directory
+        let mut file_tree = vec![
+            FileTreeItem {
+                name: "./".to_string(),
+                is_dir: true,
+                is_expanded: false,  // Start collapsed, expand on demand
+                depth: 0,
+                path: ".".to_string(),
+            },
+        ];
+
+        // Try to load root directory contents initially
+        let mut ui = Self {
             command_buffer: String::new(),
             error_message: None,
             show_help: false,
             show_git_panel: false,  // Hidden by default to save space
             show_file_explorer: true,  // Shown by default
-        }
+            file_explorer_selected: 0,
+            file_tree,
+        };
+
+        // Expand root directory to show initial contents
+        ui.file_tree[0].is_expanded = true;
+        ui.load_directory_contents(0);
+
+        ui
     }
 
     pub fn draw(
@@ -123,18 +156,18 @@ impl Ui {
 
         let header_text = vec![
             Span::raw("[Project: "),
-            Span::styled("rgb-workspace", Style::default().fg(Color::Cyan)),
+            Span::styled("rgb-workspace", Style::default().fg(Color::Blue)),
             Span::raw("] "),
             Span::raw("[Terminals: "),
             Span::styled(
                 terminal_count.to_string(),
-                Style::default().fg(Color::Green),
+                Style::default().fg(Color::DarkGray),
             ),
             Span::raw("] "),
             if let Some(id) = active_id {
                 Span::styled(
                     format!("[Active: {}]", &id.to_string()[..8]),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(Color::Magenta),
                 )
             } else {
                 Span::raw("")
@@ -142,7 +175,7 @@ impl Ui {
         ];
 
         let header = Paragraph::new(Line::from(header_text))
-            .style(Style::default().bg(Color::DarkGray));
+            .style(Style::default().bg(Color::Gray).fg(Color::Black));
 
         frame.render_widget(header, area);
     }
@@ -186,33 +219,57 @@ impl Ui {
     }
 
     fn draw_file_explorer(&self, frame: &mut Frame, area: Rect, _workspace: &WorkspaceManager) {
-        let block = Block::default()
-            .title("Files")
-            .borders(Borders::ALL)
-            .style(Style::default().fg(Color::White));
+        // First, fill the entire area with a light background
+        let bg_block = Block::default()
+            .style(Style::default().bg(Color::White));
+        frame.render_widget(bg_block, area);
 
-        // TODO: Implement actual file tree
-        let items = vec![
-            ListItem::new("▼ src/"),
-            ListItem::new("  ▶ app/"),
-            ListItem::new("  ▶ config/"),
-            ListItem::new("  ▶ git/"),
-            ListItem::new("  ▶ layout/"),
-            ListItem::new("  ▶ monitor/"),
-            ListItem::new("  ▶ terminal/"),
-            ListItem::new("  ▶ ui/"),
-            ListItem::new("  ▶ workspace/"),
-            ListItem::new("  • main.rs"),
-        ];
+        let block = Block::default()
+            .title("Files [j/k:nav, Enter:open/expand, h/l:collapse/expand]")
+            .borders(Borders::ALL)
+            .style(Style::default()
+                .fg(Color::Black)
+                .bg(Color::White));
+
+        // Build visible items from file tree
+        let mut items = Vec::new();
+        for (idx, item) in self.file_tree.iter().enumerate() {
+            let indent = "  ".repeat(item.depth);
+            let icon = if item.is_dir {
+                if item.is_expanded { "▼" } else { "▶" }
+            } else {
+                "•"
+            };
+
+            let style = if idx == self.file_explorer_selected {
+                Style::default()
+                    .fg(Color::Blue)
+                    .bg(Color::LightBlue)
+                    .add_modifier(Modifier::BOLD)
+            } else if item.is_dir {
+                Style::default()
+                    .fg(Color::Blue)
+                    .bg(Color::White)
+            } else {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::White)
+            };
+
+            items.push(ListItem::new(format!("{}{} {}", indent, icon, item.name)).style(style));
+        }
 
         let list = List::new(items)
             .block(block)
-            .style(Style::default().fg(Color::White))
+            .style(Style::default()
+                .fg(Color::Black)
+                .bg(Color::White))
             .highlight_style(
                 Style::default()
                     .add_modifier(Modifier::BOLD)
-                    .bg(Color::DarkGray),
-            );
+                    .bg(Color::Gray),
+            )
+            .highlight_symbol("> ");
 
         frame.render_widget(list, area);
     }
@@ -221,7 +278,7 @@ impl Ui {
         let block = Block::default()
             .title("Git")
             .borders(Borders::ALL)
-            .style(Style::default().fg(Color::White));
+            .style(Style::default().fg(Color::Black).bg(Color::White));
 
         // TODO: Implement actual git status
         let items = vec![
@@ -255,20 +312,22 @@ impl Ui {
 
         let footer_text = vec![
             Span::raw("["),
-            Span::styled("Ctrl+Q", Style::default().fg(Color::Yellow)),
-            Span::raw(" Quit] ["),
-            Span::styled("Tab", Style::default().fg(Color::Yellow)),
-            Span::raw(" Switch] ["),
-            Span::styled("Ctrl+T", Style::default().fg(Color::Yellow)),
+            Span::styled("Alt+I", Style::default().fg(Color::Blue)),
+            Span::raw(" Insert] ["),
+            Span::styled("Alt+F/Esc", Style::default().fg(Color::Blue)),
+            Span::raw(" Normal] ["),
+            Span::styled("Ctrl+T", Style::default().fg(Color::Blue)),
             Span::raw(" New] ["),
-            Span::styled("F1", Style::default().fg(Color::Yellow)),
+            Span::styled("Ctrl+F", Style::default().fg(Color::Blue)),
+            Span::raw(" Files] ["),
+            Span::styled("?", Style::default().fg(Color::Blue)),
             Span::raw(" Help] [Mode: "),
-            Span::styled(mode_text, Style::default().fg(Color::Cyan)),
+            Span::styled(mode_text, Style::default().fg(Color::Magenta)),
             Span::raw("]"),
         ];
 
         let footer = Paragraph::new(Line::from(footer_text))
-            .style(Style::default().bg(Color::DarkGray));
+            .style(Style::default().bg(Color::Gray).fg(Color::Black));
 
         frame.render_widget(footer, area);
     }
@@ -279,7 +338,7 @@ impl Ui {
         let block = Block::default()
             .title("Command")
             .borders(Borders::ALL)
-            .style(Style::default().fg(Color::Yellow));
+            .style(Style::default().fg(Color::Blue).bg(Color::White));
 
         let input = Paragraph::new(format!(":{}", self.command_buffer))
             .block(block)
@@ -304,30 +363,42 @@ impl Ui {
     }
 
     fn draw_help(&self, frame: &mut Frame, _size: Rect) {
-        let area = centered_rect(60, 20, frame.area());
+        let area = centered_rect(60, 25, frame.area());
 
         let block = Block::default()
-            .title("Help")
+            .title("Help (Press ? or Esc to close)")
             .borders(Borders::ALL)
-            .style(Style::default().fg(Color::Cyan));
+            .style(Style::default().fg(Color::Blue).bg(Color::White));
 
         let help_text = vec![
             "Navigation:",
-            "  h/j/k/l    - Move between terminals",
+            "  h/j/k/l    - Move between terminals/files",
             "  Tab        - Next terminal",
             "  Shift+Tab  - Previous terminal",
             "",
             "Terminal Management:",
             "  Ctrl+T     - New terminal",
-            "  Ctrl+W     - Close terminal",
+            "  Ctrl+W     - Close terminal/exit files",
+            "  Ctrl+Q     - Quit application",
+            "",
+            "File Explorer:",
+            "  Ctrl+F     - Toggle focus to/from files",
+            "  Ctrl+E     - Toggle file explorer visibility",
+            "  j/k        - Navigate files (when focused)",
+            "  h/l        - Collapse/expand folders",
+            "  Enter      - Open file in new terminal",
             "",
             "Modes:",
-            "  i          - Insert mode",
+            "  Alt+I      - Insert mode (type in terminal)",
+            "  Alt+F/Esc  - Return to Normal mode",
             "  :          - Command mode",
             "  v          - Visual mode",
-            "  Esc        - Normal mode",
+            "  ?          - Toggle this help",
             "",
-            "Press Esc to close help",
+            "Note: Use Alt+I instead of 'i' to avoid conflicts",
+            "with terminal programs like vim.",
+            "",
+            "Press ? or Esc to close help",
         ];
 
         let text = Paragraph::new(help_text.join("\n"))
@@ -365,6 +436,10 @@ impl Ui {
         self.show_help = !self.show_help;
     }
 
+    pub fn is_help_visible(&self) -> bool {
+        self.show_help
+    }
+
     pub fn toggle_git_panel(&mut self) {
         self.show_git_panel = !self.show_git_panel;
     }
@@ -383,6 +458,109 @@ impl Ui {
 
     pub fn show_config_editor(&self, _config: &AppConfig) {
         // TODO: Implement config editor
+    }
+
+    pub fn file_explorer_move_up(&mut self) {
+        if self.file_explorer_selected > 0 {
+            self.file_explorer_selected -= 1;
+        }
+    }
+
+    pub fn file_explorer_move_down(&mut self) {
+        if self.file_explorer_selected < self.file_tree.len() - 1 {
+            self.file_explorer_selected += 1;
+        }
+    }
+
+    pub fn file_explorer_toggle_expand(&mut self) {
+        if self.file_explorer_selected < self.file_tree.len() {
+            let selected_idx = self.file_explorer_selected;
+            let item = self.file_tree[selected_idx].clone();
+
+            if item.is_dir {
+                let new_state = !item.is_expanded;
+                self.file_tree[selected_idx].is_expanded = new_state;
+
+                if new_state {
+                    // Expanding - load directory contents
+                    self.load_directory_contents(selected_idx);
+                } else {
+                    // Collapsing - remove child items
+                    self.collapse_directory(selected_idx);
+                }
+            }
+        }
+    }
+
+    fn load_directory_contents(&mut self, dir_idx: usize) {
+        let dir_item = &self.file_tree[dir_idx];
+        let dir_path = &dir_item.path;
+        let dir_depth = dir_item.depth;
+
+        // Read directory contents
+        if let Ok(entries) = fs::read_dir(dir_path) {
+            let mut items_to_insert = Vec::new();
+
+            // Collect and sort entries
+            let mut entries: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+            entries.sort_by_key(|e| {
+                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                let name = e.file_name();
+                (!is_dir, name)  // Directories first, then files
+            });
+
+            for entry in entries {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+
+                // Skip hidden files starting with .
+                if name.starts_with('.') {
+                    continue;
+                }
+
+                items_to_insert.push(FileTreeItem {
+                    name: if is_dir { format!("{}/", name) } else { name },
+                    is_dir,
+                    is_expanded: false,
+                    depth: dir_depth + 1,
+                    path: path.to_string_lossy().to_string(),
+                });
+            }
+
+            // Insert items after the parent directory
+            let insert_pos = dir_idx + 1;
+            for (i, item) in items_to_insert.into_iter().enumerate() {
+                self.file_tree.insert(insert_pos + i, item);
+            }
+        }
+    }
+
+    fn collapse_directory(&mut self, dir_idx: usize) {
+        let dir_depth = self.file_tree[dir_idx].depth;
+
+        // Remove all items with depth > dir_depth that come after dir_idx
+        let mut i = dir_idx + 1;
+        while i < self.file_tree.len() {
+            if self.file_tree[i].depth > dir_depth {
+                self.file_tree.remove(i);
+            } else {
+                break;  // Reached a sibling or parent level item
+            }
+        }
+    }
+
+    pub fn file_explorer_open(&mut self) -> Option<String> {
+        if self.file_explorer_selected < self.file_tree.len() {
+            let item = &self.file_tree[self.file_explorer_selected];
+            if !item.is_dir {
+                return Some(item.path.clone());
+            } else {
+                // Toggle expansion for directories
+                self.file_explorer_toggle_expand();
+            }
+        }
+        None
     }
 }
 

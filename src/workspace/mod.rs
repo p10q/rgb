@@ -323,6 +323,11 @@ impl WorkspaceManager {
             .map(|t| t.emulator.clone())
     }
 
+    pub fn get_active_terminal_emulator(&self) -> Option<Arc<RwLock<TerminalEmulator>>> {
+        let active_id = self.active_terminal.read().clone()?;
+        self.get_terminal_emulator(active_id)
+    }
+
     pub fn resize_terminal(&self, id: TerminalId, width: u16, height: u16) -> Result<()> {
         let terminals = self.terminals.read();
         if let Some(terminal) = terminals.iter().find(|t| t.id == id) {

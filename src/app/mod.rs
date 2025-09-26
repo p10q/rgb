@@ -16,6 +16,12 @@ use std::{io, path::PathBuf};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FocusArea {
+    Terminal,
+    FileExplorer,
+}
+
 pub struct RgbApp {
     workspace: WorkspaceManager,
     layout: LayoutEngine,
@@ -24,6 +30,7 @@ pub struct RgbApp {
     state: AppState,
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     should_quit: bool,
+    focus: FocusArea,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -66,6 +73,7 @@ impl RgbApp {
             state: AppState::Normal,
             terminal,
             should_quit: false,
+            focus: FocusArea::Terminal,
         })
     }
 
@@ -193,29 +201,83 @@ impl RgbApp {
             (KeyCode::Char('t') | KeyCode::Char('T'), KeyModifiers::CONTROL) => {
                 self.workspace.create_terminal(None).await?;
             }
-            // Close terminal
+            // Close terminal or exit file explorer
             (KeyCode::Char('w') | KeyCode::Char('W'), KeyModifiers::CONTROL) => {
-                self.workspace.close_active_terminal().await?;
-                if self.workspace.terminals().is_empty() {
-                    self.should_quit = true;
+                if self.focus == FocusArea::FileExplorer {
+                    self.focus = FocusArea::Terminal;
+                } else {
+                    // Check if terminal is dead first
+                    let should_close = if let Some(emulator) = self.workspace.get_active_terminal_emulator() {
+                        true  // Always allow closing
+                    } else {
+                        false
+                    };
+
+                    if should_close {
+                        self.workspace.close_active_terminal().await?;
+                        if self.workspace.terminals().is_empty() {
+                            self.should_quit = true;
+                        }
+                    }
                 }
+            }
+            // Show help with '?'
+            (KeyCode::Char('?'), KeyModifiers::NONE) => {
+                self.ui.toggle_help();
             }
             // Navigation
             (KeyCode::Char('h'), KeyModifiers::NONE) => {
-                self.layout.focus_left(&mut self.workspace);
+                match self.focus {
+                    FocusArea::Terminal => self.layout.focus_left(&mut self.workspace),
+                    FocusArea::FileExplorer => self.ui.file_explorer_toggle_expand(),
+                }
             }
             (KeyCode::Char('j'), KeyModifiers::NONE) => {
-                self.layout.focus_down(&mut self.workspace);
+                match self.focus {
+                    FocusArea::Terminal => self.layout.focus_down(&mut self.workspace),
+                    FocusArea::FileExplorer => self.ui.file_explorer_move_down(),
+                }
             }
             (KeyCode::Char('k'), KeyModifiers::NONE) => {
-                self.layout.focus_up(&mut self.workspace);
+                match self.focus {
+                    FocusArea::Terminal => self.layout.focus_up(&mut self.workspace),
+                    FocusArea::FileExplorer => self.ui.file_explorer_move_up(),
+                }
             }
             (KeyCode::Char('l'), KeyModifiers::NONE) => {
-                self.layout.focus_right(&mut self.workspace);
+                match self.focus {
+                    FocusArea::Terminal => self.layout.focus_right(&mut self.workspace),
+                    FocusArea::FileExplorer => self.ui.file_explorer_toggle_expand(),
+                }
             }
-            // Mode switching
+            // Enter key for file explorer
+            (KeyCode::Enter, KeyModifiers::NONE) if self.focus == FocusArea::FileExplorer => {
+                if let Some(path) = self.ui.file_explorer_open() {
+                    // Open file in new terminal with appropriate editor
+                    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+                    let command = format!("{} {}", editor, path);
+                    self.workspace.create_terminal(Some(command)).await?;
+                    self.focus = FocusArea::Terminal;
+                }
+            }
+            // Mode switching - Use Cmd+I (or Alt+I on Linux/Windows) for insert mode
             (KeyCode::Char('i'), KeyModifiers::NONE) => {
-                tracing::info!("Switching to Insert mode");
+                // In normal mode, 'i' alone does nothing - must use Cmd+I
+                // This allows 'i' to work normally in terminal programs like vim
+                tracing::debug!("Plain 'i' key - not switching to insert mode (use Cmd+I)");
+            }
+            // Cmd+I or Alt+I to enter insert mode
+            (KeyCode::Char('i') | KeyCode::Char('I'), KeyModifiers::ALT) => {
+                // Check if current terminal is alive before entering insert mode
+                if let Some(emulator) = self.workspace.get_active_terminal_emulator() {
+                    let is_alive = emulator.read().is_alive();
+                    if !is_alive {
+                        tracing::info!("Cannot enter insert mode - terminal is dead");
+                        // Don't switch to insert mode for dead terminals
+                        return Ok(());
+                    }
+                }
+                tracing::info!("Switching to Insert mode via Alt+I");
                 self.state = AppState::Insert;
             }
             (KeyCode::Char(':'), KeyModifiers::NONE) => {
@@ -227,6 +289,17 @@ impl RgbApp {
             // Toggle file explorer
             (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
                 self.ui.toggle_file_explorer();
+                // Reset focus to terminal if explorer was closed
+                self.focus = FocusArea::Terminal;
+            }
+            // Switch focus to file explorer
+            (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                self.focus = if self.focus == FocusArea::FileExplorer {
+                    FocusArea::Terminal
+                } else {
+                    FocusArea::FileExplorer
+                };
+                tracing::info!("Focus switched to {:?}", self.focus);
             }
             // Toggle git panel
             (KeyCode::Char('g'), KeyModifiers::CONTROL) => {
@@ -251,6 +324,53 @@ impl RgbApp {
     async fn handle_insert_mode(&mut self, key: KeyEvent) -> Result<()> {
         tracing::info!("Insert mode handling key: {:?}, modifiers bits: {:b}", key, key.modifiers.bits());
 
+        // Check if current terminal is dead - if so, allow mode switching and terminal management
+        if let Some(emulator) = self.workspace.get_active_terminal_emulator() {
+            let is_alive = emulator.read().is_alive();
+            if !is_alive {
+                // Terminal is dead, but still allow essential keys
+                match (key.code, key.modifiers) {
+                    // Allow exiting insert mode
+                    (KeyCode::Esc, _) => {
+                        tracing::info!("Exiting insert mode (terminal is dead)");
+                        self.state = AppState::Normal;
+                        return Ok(());
+                    }
+                    // Allow Alt+F to exit insert mode
+                    (KeyCode::Char('f') | KeyCode::Char('F'), KeyModifiers::ALT) => {
+                        tracing::info!("Alt+F detected - exiting insert mode (terminal is dead)");
+                        self.state = AppState::Normal;
+                        return Ok(());
+                    }
+                    // Allow closing the dead terminal
+                    (KeyCode::Char('w') | KeyCode::Char('W'), KeyModifiers::CONTROL) => {
+                        tracing::info!("Closing dead terminal");
+                        self.workspace.close_active_terminal().await?;
+                        if self.workspace.terminals().is_empty() {
+                            self.should_quit = true;
+                        }
+                        return Ok(());
+                    }
+                    // Allow switching terminals
+                    (KeyCode::Tab, _) => {
+                        self.workspace.next_terminal();
+                        return Ok(());
+                    }
+                    // Allow quitting the app
+                    (KeyCode::Char('q') | KeyCode::Char('Q'), KeyModifiers::CONTROL) => {
+                        tracing::info!("Ctrl+Q - quitting app");
+                        self.should_quit = true;
+                        return Ok(());
+                    }
+                    _ => {
+                        // Ignore other input for dead terminals (don't forward to terminal)
+                        tracing::debug!("Ignoring key input for dead terminal");
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
         // Check for Ctrl combinations first (they take priority)
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             tracing::info!("Ctrl modifier detected");
@@ -267,9 +387,13 @@ impl RgbApp {
                 }
                 KeyCode::Char('w') | KeyCode::Char('W') => {
                     tracing::info!("Ctrl+W in Insert mode - closing terminal");
-                    self.workspace.close_active_terminal().await?;
-                    if self.workspace.terminals().is_empty() {
-                        self.should_quit = true;
+                    if self.focus == FocusArea::FileExplorer {
+                        self.focus = FocusArea::Terminal;
+                    } else {
+                        self.workspace.close_active_terminal().await?;
+                        if self.workspace.terminals().is_empty() {
+                            self.should_quit = true;
+                        }
                     }
                     return Ok(());
                 }
@@ -284,8 +408,19 @@ impl RgbApp {
 
         // Now check for special keys
         match key.code {
+            // Allow both Esc and Alt+Esc to exit insert mode
             KeyCode::Esc => {
                 tracing::info!("ESC detected - switching back to Normal mode");
+                // Close help if it's open, otherwise switch to Normal mode
+                if self.ui.is_help_visible() {
+                    self.ui.toggle_help();
+                } else {
+                    self.state = AppState::Normal;
+                }
+            }
+            // Alt+F as an alternative to exit insert mode (easier than Esc on some keyboards)
+            KeyCode::Char('f') | KeyCode::Char('F') if key.modifiers.contains(KeyModifiers::ALT) => {
+                tracing::info!("Alt+F detected - switching back to Normal mode");
                 self.state = AppState::Normal;
             }
             _ => {

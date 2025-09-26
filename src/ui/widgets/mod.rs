@@ -40,9 +40,9 @@ impl Widget for TerminalWidget {
 
         // Create border
         let border_style = if self.active {
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(Color::Blue)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(Color::Gray)
         };
 
         let block = Block::default()
@@ -69,6 +69,7 @@ impl Widget for TerminalWidget {
         // Get terminal content AFTER resize
         let emulator = self.emulator.read();
         let content = emulator.get_visible_content();
+        let colors = emulator.get_display_colors();
 
         tracing::debug!("Got {} lines of content from terminal", content.len());
 
@@ -94,12 +95,12 @@ impl Widget for TerminalWidget {
                 let y_pos = inner_area.y + y;
                 if let Some(cell) = buf.cell_mut((x_pos, y_pos)) {
                     cell.set_char(' ');
-                    cell.set_style(Style::default().bg(Color::Black));
+                    cell.set_style(Style::default().bg(Color::White));
                 }
             }
         }
 
-        // Now draw the content
+        // Now draw the content with proper colors
         for (y, line) in content.iter().enumerate() {
             if y >= inner_area.height as usize {
                 break;
@@ -115,32 +116,28 @@ impl Widget for TerminalWidget {
 
                 let x_pos = inner_area.x + x as u16;
 
-                // Set character in buffer (including spaces)
+                // Set character in buffer with proper colors from terminal
                 if let Some(cell) = buf.cell_mut((x_pos, y_pos)) {
-                    // Make spaces visible with a different background
-                    if ch == ' ' {
-                        cell.set_char(' ');
-                        cell.set_style(Style::default().fg(Color::White).bg(Color::Black));
+                    cell.set_char(ch);
+
+                    // Get colors from the terminal emulator
+                    let (fg, bg) = if y < colors.len() && x < colors[y].len() {
+                        let (term_fg, term_bg) = colors[y][x];
+                        // Map Reset to default terminal colors (light theme)
+                        let fg = if term_fg == Color::Reset { Color::Black } else { term_fg };
+                        let bg = if term_bg == Color::Reset { Color::White } else { term_bg };
+                        (fg, bg)
                     } else {
-                        cell.set_char(ch);
-                        cell.set_style(Style::default().fg(Color::Green).bg(Color::Black));
-                    }
+                        // Default colors for out-of-bounds (light theme)
+                        (Color::Black, Color::White)
+                    };
+
+                    cell.set_style(Style::default().fg(fg).bg(bg));
                 }
             }
         }
 
-        // Add a test string to make sure rendering works at all
-        if inner_area.width > 10 && inner_area.height > 0 {
-            let test_msg = "DEBUG: Terminal Widget Active";
-            for (i, ch) in test_msg.chars().enumerate() {
-                if i < inner_area.width as usize {
-                    if let Some(cell) = buf.cell_mut((inner_area.x + i as u16, inner_area.y)) {
-                        cell.set_char(ch);
-                        cell.set_style(Style::default().fg(Color::Red).bg(Color::Black));
-                    }
-                }
-            }
-        }
+        // Remove the debug message - no longer needed
 
         // Draw cursor if active and show_cursor is true
         if self.active && self.show_cursor {
@@ -152,7 +149,7 @@ impl Widget for TerminalWidget {
                 cell.set_style(
                     cell.style()
                         .add_modifier(Modifier::REVERSED)
-                        .bg(Color::White),
+                        .bg(Color::Black),
                 );
             }
         }
