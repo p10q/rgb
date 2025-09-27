@@ -23,6 +23,7 @@ pub struct Ui {
     show_file_explorer: bool,
     file_explorer_selected: usize,  // Index of selected item in file explorer
     file_tree: Vec<FileTreeItem>,
+    file_explorer_area: Option<Rect>,  // Track the file explorer area for mouse clicks
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +57,7 @@ impl Ui {
             show_file_explorer: true,  // Shown by default
             file_explorer_selected: 0,
             file_tree,
+            file_explorer_area: None,
         };
 
         // Expand root directory to show initial contents
@@ -66,7 +68,7 @@ impl Ui {
     }
 
     pub fn draw(
-        &self,
+        &mut self,
         frame: &mut Frame,
         workspace: &WorkspaceManager,
         layout: &mut LayoutEngine,
@@ -218,7 +220,9 @@ impl Ui {
         }
     }
 
-    fn draw_file_explorer(&self, frame: &mut Frame, area: Rect, _workspace: &WorkspaceManager) {
+    fn draw_file_explorer(&mut self, frame: &mut Frame, area: Rect, _workspace: &WorkspaceManager) {
+        // Store the area for mouse click handling
+        self.file_explorer_area = Some(area);
         // First, fill the entire area with a light background
         let bg_block = Block::default()
             .style(Style::default().bg(Color::White));
@@ -314,7 +318,7 @@ impl Ui {
             Span::raw("["),
             Span::styled("Alt+I", Style::default().fg(Color::Blue)),
             Span::raw(" Insert] ["),
-            Span::styled("Alt+F/Esc", Style::default().fg(Color::Blue)),
+            Span::styled("jj/jk", Style::default().fg(Color::Blue)),
             Span::raw(" Normal] ["),
             Span::styled("Ctrl+T", Style::default().fg(Color::Blue)),
             Span::raw(" New] ["),
@@ -390,7 +394,9 @@ impl Ui {
             "",
             "Modes:",
             "  Alt+I      - Insert mode (type in terminal)",
-            "  Alt+F/Esc  - Return to Normal mode",
+            "  jj or jk   - Quick exit to Normal mode (vim-style)",
+            "  Ctrl+[     - Exit to Normal mode (works like Esc)",
+            "  Alt+F      - Also exits to Normal mode",
             "  :          - Command mode",
             "  v          - Visual mode",
             "  ?          - Toggle this help",
@@ -561,6 +567,24 @@ impl Ui {
             }
         }
         None
+    }
+
+    pub fn get_file_explorer_area(&self) -> Option<Rect> {
+        self.file_explorer_area
+    }
+
+    pub fn handle_file_explorer_click(&mut self, x: u16, y: u16) {
+        if let Some(area) = self.file_explorer_area {
+            // Calculate which item was clicked based on y position
+            let relative_y = y.saturating_sub(area.y + 1);  // +1 for the border
+            let clicked_index = relative_y as usize;
+
+            // Check if click is within the visible items
+            if clicked_index < self.file_tree.len() {
+                self.file_explorer_selected = clicked_index;
+                // Double-click logic could be added here to open files
+            }
+        }
     }
 }
 

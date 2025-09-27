@@ -3,7 +3,6 @@ use crossterm::event::KeyEvent;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{Read, Write, ErrorKind};
 use std::path::Path;
-use vte::{Params, Parser, Perform};
 
 // For setting non-blocking mode on Unix
 #[cfg(unix)]
@@ -14,15 +13,10 @@ pub struct TerminalEmulator {
     writer: Box<dyn Write + Send>,
     _child: Box<dyn Child + Send>,  // Keep the child process alive
     size: (u16, u16),
-    output_buffer: Vec<u8>,
-    display_buffer: Vec<Vec<char>>,
-    display_colors: Vec<Vec<(Color, Color)>>,  // (foreground, background)
-    cursor_pos: (u16, u16),
+    parser: vt100::Parser,
     active_files: Vec<String>,
     has_pending_input: bool,  // Track if we've sent input that needs reading
     is_alive: bool,  // Track if terminal process is still running
-    current_fg: Color,
-    current_bg: Color,
 }
 
 use ratatui::style::Color;
@@ -88,13 +82,9 @@ impl TerminalEmulator {
 
         tracing::info!("Terminal created with command: {} in dir: {:?}", command, working_dir);
 
-        // Initialize display buffer and color buffer
-        let mut display_buffer = Vec::with_capacity(size.1 as usize);
-        let mut display_colors = Vec::with_capacity(size.1 as usize);
-        for _ in 0..size.1 {
-            display_buffer.push(vec![' '; size.0 as usize]);
-            display_colors.push(vec![(Color::Reset, Color::Reset); size.0 as usize]);
-        }
+        // Create vt100 parser
+        let mut parser = vt100::Parser::default();
+        parser.set_size(size.1, size.0);
 
         let writer = pair.master.take_writer()?;
 
@@ -103,15 +93,10 @@ impl TerminalEmulator {
             writer,
             _child: child,  // Keep the child process alive
             size,
-            output_buffer: Vec::new(),
-            display_buffer,
-            display_colors,
-            cursor_pos: (0, 0),
+            parser,
             active_files: Vec::new(),
             has_pending_input: false,
             is_alive: true,
-            current_fg: Color::Reset,
-            current_bg: Color::Reset,
         };
 
         Ok(emulator)
@@ -153,34 +138,8 @@ impl TerminalEmulator {
         };
         self.master.resize(pty_size)?;
 
-        // Resize display buffer and color buffer, preserving existing content where possible
-        let old_buffer = std::mem::take(&mut self.display_buffer);
-        let old_colors = std::mem::take(&mut self.display_colors);
-        self.display_buffer = Vec::with_capacity(size.1 as usize);
-        self.display_colors = Vec::with_capacity(size.1 as usize);
-
-        for y in 0..size.1 as usize {
-            let mut new_line = vec![' '; size.0 as usize];
-            let mut new_colors = vec![(Color::Reset, Color::Reset); size.0 as usize];
-
-            // Copy over existing content if available
-            if y < old_buffer.len() {
-                let old_line = &old_buffer[y];
-                for x in 0..std::cmp::min(size.0 as usize, old_line.len()) {
-                    new_line[x] = old_line[x];
-                    if y < old_colors.len() && x < old_colors[y].len() {
-                        new_colors[x] = old_colors[y][x];
-                    }
-                }
-            }
-
-            self.display_buffer.push(new_line);
-            self.display_colors.push(new_colors);
-        }
-
-        // Adjust cursor position if needed
-        self.cursor_pos.0 = self.cursor_pos.0.min(size.0 - 1);
-        self.cursor_pos.1 = self.cursor_pos.1.min(size.1 - 1);
+        // Resize vt100 parser
+        self.parser.set_size(size.1, size.0);
 
         Ok(())
     }
@@ -189,11 +148,30 @@ impl TerminalEmulator {
         self.is_alive
     }
 
-    pub fn get_display_colors(&self) -> &Vec<Vec<(Color, Color)>> {
-        &self.display_colors
+    pub fn get_display_colors(&self) -> Vec<Vec<(Color, Color)>> {
+        let mut colors = Vec::new();
+
+        for row in 0..self.size.1 as usize {
+            let mut row_colors = Vec::new();
+            for col in 0..self.size.0 as usize {
+                // vt100 doesn't expose cell colors in an easy way
+                let fg = Color::Reset;
+                let bg = Color::Reset;
+                row_colors.push((fg, bg));
+            }
+            colors.push(row_colors);
+        }
+
+        colors
     }
 
     pub fn update(&mut self) -> Result<bool> {  // Returns true if there was output
+        // Don't try to read from dead terminals
+        if !self.is_alive {
+            tracing::trace!("Skipping update for dead terminal");
+            return Ok(false);
+        }
+
         tracing::trace!("Terminal::update called, has_pending_input: {}", self.has_pending_input);
 
         let mut buffer = [0u8; 4096];
@@ -212,13 +190,9 @@ impl TerminalEmulator {
         };
 
         // If we're expecting output (just sent input), do more iterations
-        // Otherwise just do 1 iteration to check for any async output
         let max_iterations = if self.has_pending_input {
             tracing::debug!("Has pending input, will do up to 10 read iterations");
             10  // More iterations when we expect output
-        } else if self.output_buffer.is_empty() {
-            tracing::debug!("Empty buffer, will do up to 10 read iterations");
-            10  // First time, read more
         } else {
             tracing::trace!("No pending input, will do 1 read iteration");
             1   // Just check once for async output
@@ -229,12 +203,6 @@ impl TerminalEmulator {
         }
         let mut iterations = 0;
 
-        // Read all available data (with a limit to prevent infinite loops)
-        tracing::debug!("Starting read loop with max {} iterations", max_iterations);
-
-        // First, do a single read to see if there's any data
-        let mut has_data = false;
-
         loop {
             iterations += 1;
             if iterations > max_iterations {
@@ -244,65 +212,35 @@ impl TerminalEmulator {
 
             tracing::trace!("Read iteration {}", iterations);
 
-            // After 6 successful reads in any update, stop
-            if iterations > 6 && has_data {
-                tracing::debug!("Stopping after {} reads to avoid blocking", iterations - 1);
-                break;
-            }
-
             match reader.read(&mut buffer) {
                 Ok(0) => {
                     // EOF - terminal process has exited
-                    tracing::debug!("Read returned 0 bytes (EOF) at iteration {}", iterations);
-
-                    // If we're still alive and get EOF, the process has just exited
                     if self.is_alive {
-                        // Mark terminal as dead
+                        tracing::error!("TERMINAL DIED: Process has exited - marking as dead");
                         self.is_alive = false;
-                        tracing::info!("Terminal process has exited - marking as dead");
 
-                        // Add exit message to display
+                        // Add exit message to screen
                         let exit_msg = "[Process exited - Press Ctrl+W to close]";
-                        let y = self.cursor_pos.1.min(self.size.1 - 1) as usize;
-                        if y < self.display_buffer.len() {
-                            for (i, ch) in exit_msg.chars().enumerate() {
-                                if i < self.display_buffer[y].len() {
-                                    self.display_buffer[y][i] = ch;
-                                    self.display_colors[y][i] = (Color::Yellow, Color::Reset);
-                                }
-                            }
-                        }
+                        // Process the message through vt100 parser
+                        self.parser.process(exit_msg.as_bytes());
+
                         // Return true to force a redraw showing the exit message
                         return Ok(true);
+                    } else {
+                        // Already dead, just return
+                        tracing::trace!("Terminal already dead, skipping further reads");
+                        return Ok(false);
                     }
-                    break;
                 }
                 Ok(n) => {
                     tracing::debug!("Read {} bytes on iteration {}", n, iterations);
-                    has_data = true;
                     total_read += n;
-                    self.output_buffer.extend_from_slice(&buffer[..n]);
-
-                    // Only log in trace mode to avoid spam
-                    if tracing::enabled!(tracing::Level::TRACE) {
-                        let text = String::from_utf8_lossy(&buffer[..n]);
-                        tracing::trace!("Read {} bytes: {:?}", n, text);
-                    }
-
-                    // Log first few bytes for debugging
-                    let preview = &buffer[..n.min(50)];
-                    let preview_str = String::from_utf8_lossy(preview);
-                    tracing::debug!("Read data preview ({}b): {:?}", n, preview_str);
 
                     // Parse for file references first
                     self.parse_for_files(&buffer[..n]);
 
-                    // Process through VTE parser - batch processing
-                    let mut parser = Parser::new();
-                    let slice = &buffer[..n];
-                    for byte in slice {
-                        parser.advance(self, *byte);
-                    }
+                    // Process through vt100 parser
+                    self.parser.process(&buffer[..n]);
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
                     // No more data available (non-blocking read)
@@ -316,25 +254,10 @@ impl TerminalEmulator {
             }
         }
 
-        // Only log buffer state once at the end if we read something
-        if total_read > 0 && tracing::enabled!(tracing::Level::DEBUG) {
-            let non_empty_lines: Vec<_> = self.display_buffer.iter()
-                .enumerate()
-                .filter(|(_, line)| line.iter().any(|&c| c != ' '))
-                .take(3)
-                .map(|(i, line)| (i + 1, line.iter().collect::<String>()))
-                .collect();
-
-            if !non_empty_lines.is_empty() {
-                tracing::debug!("Terminal has {} lines of content", non_empty_lines.len());
-            }
-        }
-
         if total_read > 0 {
-            tracing::debug!("Total read: {} bytes, cursor at {:?}", total_read, self.cursor_pos);
+            tracing::debug!("Total read: {} bytes", total_read);
         }
 
-        tracing::debug!("Terminal update complete, read {} total bytes", total_read);
         Ok(total_read > 0)
     }
 
@@ -365,7 +288,7 @@ impl TerminalEmulator {
     pub fn handle_key_event(&mut self, key: KeyEvent) -> Result<()> {
         // Don't process keys if terminal is dead
         if !self.is_alive {
-            tracing::debug!("Ignoring key event for dead terminal: {:?}", key);
+            tracing::warn!("Ignoring key event for dead terminal: {:?}", key);
             return Ok(());
         }
 
@@ -381,350 +304,39 @@ impl TerminalEmulator {
     }
 
     pub fn get_visible_content(&self) -> Vec<String> {
-        let content: Vec<String> = self.display_buffer
-            .iter()
-            .map(|line| line.iter().collect::<String>())
-            .collect();
+        // Get the screen contents as a string and split by lines
+        let screen_str = self.parser.screen().contents();
+        let lines: Vec<String> = screen_str.lines().map(|s| s.to_string()).collect();
 
-        // Debug log non-empty lines
-        let non_empty_count = content.iter().filter(|line| !line.trim().is_empty()).count();
-        if non_empty_count > 0 {
-            tracing::trace!("Display buffer has {} non-empty lines out of {}", non_empty_count, content.len());
-
-            // Log line 4 specifically if it exists
-            if content.len() > 4 {
-                let line4 = &content[4];
-                if !line4.trim().is_empty() {
-                    tracing::debug!("Line 4 content (len {}): {:?}", line4.len(), line4);
+        // Pad or truncate to match terminal size
+        let mut content = Vec::new();
+        for i in 0..self.size.1 as usize {
+            if i < lines.len() {
+                let mut line = lines[i].clone();
+                // Pad line to terminal width
+                while line.len() < self.size.0 as usize {
+                    line.push(' ');
                 }
+                content.push(line);
+            } else {
+                // Empty line
+                content.push(" ".repeat(self.size.0 as usize));
             }
         }
-
         content
     }
 
     pub fn get_cursor_position(&self) -> (u16, u16) {
-        self.cursor_pos
+        let (row, col) = self.parser.screen().cursor_position();
+        (col as u16, row as u16)
     }
 
     pub fn scroll(&mut self, _lines: isize) {
-        // TODO: Implement scrollback
+        // vt100 handles scrolling internally
     }
 
     pub fn get_active_files(&self) -> &[String] {
         &self.active_files
-    }
-}
-
-// VTE Perform implementation for processing terminal sequences
-impl Perform for TerminalEmulator {
-    fn print(&mut self, c: char) {
-        let (x, y) = self.cursor_pos;
-        tracing::debug!("VTE print '{}' at cursor ({}, {}), buffer size ({} x {})",
-            c, x, y, self.size.0, self.size.1);
-
-        if (y as usize) < self.display_buffer.len() && (x as usize) < self.display_buffer[y as usize].len() {
-            self.display_buffer[y as usize][x as usize] = c;
-            self.display_colors[y as usize][x as usize] = (self.current_fg, self.current_bg);
-            self.cursor_pos.0 = x + 1;
-
-            // Handle line wrap
-            if self.cursor_pos.0 >= self.size.0 {
-                self.cursor_pos.0 = 0;
-                self.cursor_pos.1 = (self.cursor_pos.1 + 1).min(self.size.1 - 1);
-            }
-
-            tracing::debug!("Updated buffer at ({}, {}), new cursor at ({}, {})",
-                x, y, self.cursor_pos.0, self.cursor_pos.1);
-        } else {
-            tracing::warn!("Print out of bounds: cursor ({}, {}) for buffer size ({} x {})",
-                x, y, self.display_buffer[0].len(), self.display_buffer.len());
-        }
-    }
-
-    fn execute(&mut self, byte: u8) {
-        match byte {
-            b'\n' => {
-                self.cursor_pos.1 = (self.cursor_pos.1 + 1).min(self.size.1 - 1);
-                self.cursor_pos.0 = 0;
-            }
-            b'\r' => {
-                self.cursor_pos.0 = 0;
-            }
-            b'\t' => {
-                self.cursor_pos.0 = ((self.cursor_pos.0 / 8) + 1) * 8;
-                if self.cursor_pos.0 >= self.size.0 {
-                    self.cursor_pos.0 = self.size.0 - 1;
-                }
-            }
-            0x08 => {
-                // Backspace
-                if self.cursor_pos.0 > 0 {
-                    self.cursor_pos.0 -= 1;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn hook(&mut self, _params: &Params, _intermediates: &[u8], _ignore: bool, _c: char) {
-        // Not implemented for basic terminal
-    }
-
-    fn put(&mut self, _byte: u8) {
-        // Not implemented for basic terminal
-    }
-
-    fn unhook(&mut self) {
-        // Not implemented for basic terminal
-    }
-
-    fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {
-        // Not implemented for basic terminal
-    }
-
-    fn csi_dispatch(&mut self, params: &Params, _intermediates: &[u8], _ignore: bool, c: char) {
-        match c {
-            'H' | 'f' => {
-                // Cursor position
-                let row = *params.iter().next().and_then(|p| p.first()).unwrap_or(&1) as u16;
-                let col = *params.iter().nth(1).and_then(|p| p.first()).unwrap_or(&1) as u16;
-                let new_pos = (col.saturating_sub(1), row.saturating_sub(1));
-                tracing::debug!("CSI cursor position: row={}, col={}, setting cursor to {:?}",
-                    row, col, new_pos);
-                self.cursor_pos = new_pos;
-            }
-            'A' => {
-                // Cursor up
-                let n = *params.iter().next().and_then(|p| p.first()).unwrap_or(&1) as u16;
-                self.cursor_pos.1 = self.cursor_pos.1.saturating_sub(n);
-            }
-            'B' => {
-                // Cursor down
-                let n = *params.iter().next().and_then(|p| p.first()).unwrap_or(&1) as u16;
-                self.cursor_pos.1 = (self.cursor_pos.1 + n).min(self.size.1 - 1);
-            }
-            'C' => {
-                // Cursor forward
-                let n = *params.iter().next().and_then(|p| p.first()).unwrap_or(&1) as u16;
-                self.cursor_pos.0 = (self.cursor_pos.0 + n).min(self.size.0 - 1);
-            }
-            'D' => {
-                // Cursor backward
-                let n = *params.iter().next().and_then(|p| p.first()).unwrap_or(&1) as u16;
-                self.cursor_pos.0 = self.cursor_pos.0.saturating_sub(n);
-            }
-            'J' => {
-                // Clear screen
-                let mode = *params.iter().next().and_then(|p| p.first()).unwrap_or(&0);
-                match mode {
-                    0 => {
-                        // Clear from cursor to end
-                        let (x, y) = self.cursor_pos;
-                        for row in y as usize..self.display_buffer.len() {
-                            let start = if row == y as usize { x as usize } else { 0 };
-                            for col in start..self.display_buffer[row].len() {
-                                self.display_buffer[row][col] = ' ';
-                                if row < self.display_colors.len() && col < self.display_colors[row].len() {
-                                    self.display_colors[row][col] = (Color::Reset, Color::Reset);
-                                }
-                            }
-                        }
-                    }
-                    1 => {
-                        // Clear from beginning to cursor
-                        let (x, y) = self.cursor_pos;
-                        for row in 0..=y as usize {
-                            let end = if row == y as usize { x as usize + 1 } else { self.display_buffer[row].len() };
-                            for col in 0..end {
-                                if row < self.display_buffer.len() && col < self.display_buffer[row].len() {
-                                    self.display_buffer[row][col] = ' ';
-                                    if row < self.display_colors.len() && col < self.display_colors[row].len() {
-                                        self.display_colors[row][col] = (Color::Reset, Color::Reset);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    2 => {
-                        // Clear entire screen
-                        for row in 0..self.display_buffer.len() {
-                            for col in 0..self.display_buffer[row].len() {
-                                self.display_buffer[row][col] = ' ';
-                                if row < self.display_colors.len() && col < self.display_colors[row].len() {
-                                    self.display_colors[row][col] = (Color::Reset, Color::Reset);
-                                }
-                            }
-                        }
-                        // Reset cursor to top-left
-                        self.cursor_pos = (0, 0);
-                    }
-                    _ => {}
-                }
-                tracing::trace!("Clear screen mode {}", mode);
-            }
-            'K' => {
-                // Clear line
-                let mode = *params.iter().next().and_then(|p| p.first()).unwrap_or(&0);
-                let y = self.cursor_pos.1 as usize;
-                if y < self.display_buffer.len() {
-                    match mode {
-                        0 => {
-                            // Clear from cursor to end of line
-                            for col in self.cursor_pos.0 as usize..self.display_buffer[y].len() {
-                                self.display_buffer[y][col] = ' ';
-                                self.display_colors[y][col] = (Color::Reset, Color::Reset);
-                            }
-                        }
-                        2 => {
-                            // Clear entire line
-                            for col in 0..self.display_buffer[y].len() {
-                                self.display_buffer[y][col] = ' ';
-                                self.display_colors[y][col] = (Color::Reset, Color::Reset);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            'm' => {
-                // SGR - Select Graphic Rendition (colors and text attributes)
-                if params.is_empty() {
-                    // No params means reset
-                    self.current_fg = Color::Reset;
-                    self.current_bg = Color::Reset;
-                } else {
-                    for param in params {
-                        if let Some(&code) = param.first() {
-                            match code {
-                                0 => {
-                                    // Reset all
-                                    self.current_fg = Color::Reset;
-                                    self.current_bg = Color::Reset;
-                                }
-                                // Foreground colors
-                                30 => self.current_fg = Color::Black,
-                                31 => self.current_fg = Color::Red,
-                                32 => self.current_fg = Color::Green,
-                                33 => self.current_fg = Color::Yellow,
-                                34 => self.current_fg = Color::Blue,
-                                35 => self.current_fg = Color::Magenta,
-                                36 => self.current_fg = Color::Cyan,
-                                37 => self.current_fg = Color::Gray,
-                                // Bright foreground colors
-                                90 => self.current_fg = Color::DarkGray,
-                                91 => self.current_fg = Color::LightRed,
-                                92 => self.current_fg = Color::LightGreen,
-                                93 => self.current_fg = Color::LightYellow,
-                                94 => self.current_fg = Color::LightBlue,
-                                95 => self.current_fg = Color::LightMagenta,
-                                96 => self.current_fg = Color::LightCyan,
-                                97 => self.current_fg = Color::White,
-                                39 => self.current_fg = Color::Reset,  // Default foreground
-                                // Background colors
-                                40 => self.current_bg = Color::Black,
-                                41 => self.current_bg = Color::Red,
-                                42 => self.current_bg = Color::Green,
-                                43 => self.current_bg = Color::Yellow,
-                                44 => self.current_bg = Color::Blue,
-                                45 => self.current_bg = Color::Magenta,
-                                46 => self.current_bg = Color::Cyan,
-                                47 => self.current_bg = Color::Gray,
-                                // Bright background colors
-                                100 => self.current_bg = Color::DarkGray,
-                                101 => self.current_bg = Color::LightRed,
-                                102 => self.current_bg = Color::LightGreen,
-                                103 => self.current_bg = Color::LightYellow,
-                                104 => self.current_bg = Color::LightBlue,
-                                105 => self.current_bg = Color::LightMagenta,
-                                106 => self.current_bg = Color::LightCyan,
-                                107 => self.current_bg = Color::White,
-                                49 => self.current_bg = Color::Reset,  // Default background
-                                _ => {
-                                    tracing::debug!("Unhandled SGR code: {}", code);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            'L' => {
-                // Insert lines
-                let n = *params.iter().next().and_then(|p| p.first()).unwrap_or(&1) as usize;
-                let y = self.cursor_pos.1 as usize;
-                tracing::trace!("Insert {} lines at row {}", n, y);
-                // Simple implementation - just clear the lines
-                for i in y..std::cmp::min(y + n, self.display_buffer.len()) {
-                    for col in 0..self.display_buffer[i].len() {
-                        self.display_buffer[i][col] = ' ';
-                        if i < self.display_colors.len() && col < self.display_colors[i].len() {
-                            self.display_colors[i][col] = (Color::Reset, Color::Reset);
-                        }
-                    }
-                }
-            }
-            'M' => {
-                // Delete lines
-                let n = *params.iter().next().and_then(|p| p.first()).unwrap_or(&1) as usize;
-                let y = self.cursor_pos.1 as usize;
-                tracing::trace!("Delete {} lines at row {}", n, y);
-                // Simple implementation - shift lines up
-                for i in y..self.display_buffer.len() {
-                    if i + n < self.display_buffer.len() {
-                        // Copy from line below
-                        for col in 0..self.display_buffer[i].len() {
-                            self.display_buffer[i][col] = self.display_buffer[i + n][col];
-                            if i < self.display_colors.len() && col < self.display_colors[i].len() {
-                                self.display_colors[i][col] = self.display_colors[i + n][col];
-                            }
-                        }
-                    } else {
-                        // Clear the line
-                        for col in 0..self.display_buffer[i].len() {
-                            self.display_buffer[i][col] = ' ';
-                            if i < self.display_colors.len() && col < self.display_colors[i].len() {
-                                self.display_colors[i][col] = (Color::Reset, Color::Reset);
-                            }
-                        }
-                    }
-                }
-            }
-            _ => {
-                tracing::trace!("Unhandled CSI sequence: '{}' params={:?}", c, params);
-            }
-        }
-    }
-
-    fn esc_dispatch(&mut self, intermediates: &[u8], _ignore: bool, byte: u8) {
-        match byte {
-            b'c' => {
-                // RIS - Reset to Initial State
-                tracing::debug!("ESC c - Reset to Initial State");
-                // Clear screen and reset cursor
-                for row in 0..self.display_buffer.len() {
-                    for col in 0..self.display_buffer[row].len() {
-                        self.display_buffer[row][col] = ' ';
-                        if row < self.display_colors.len() && col < self.display_colors[row].len() {
-                            self.display_colors[row][col] = (Color::Reset, Color::Reset);
-                        }
-                    }
-                }
-                self.cursor_pos = (0, 0);
-            }
-            b'7' => {
-                // DECSC - Save cursor position
-                tracing::trace!("ESC 7 - Save cursor position");
-                // We could store this if needed
-            }
-            b'8' => {
-                // DECRC - Restore cursor position
-                tracing::trace!("ESC 8 - Restore cursor position");
-                // We could restore this if needed
-            }
-            _ => {
-                tracing::trace!("Unhandled ESC sequence: intermediates={:?}, byte={}", intermediates, byte);
-            }
-        }
     }
 }
 

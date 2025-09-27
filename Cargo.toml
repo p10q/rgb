@@ -16,7 +16,8 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 
 # Terminal Emulation
 portable-pty = "0.8"
-vte = "0.13"
+vt100 = "0.15"  # Better ANSI parser than vte
+libc = "0.2"
 strip-ansi-escapes = "0.2"
 
 # Async Runtime
@@ -59,7 +60,6 @@ termion = "4.0"
 unicode-width = "0.2"
 unicode-segmentation = "1.11"
 regex = "1.11"
-libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3.12"

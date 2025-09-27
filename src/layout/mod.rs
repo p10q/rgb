@@ -242,6 +242,10 @@ impl LayoutEngine {
         self.mode = mode;
     }
 
+    pub fn get_terminal_areas(&self) -> Vec<(TerminalId, Rect)> {
+        self.terminal_positions.iter().map(|(id, rect)| (*id, *rect)).collect()
+    }
+
     pub fn apply_layout(&mut self, layout_name: &str) -> Result<()> {
         let mode = match layout_name {
             "vertical" => LayoutMode::Tiled(TileLayout::Vertical),

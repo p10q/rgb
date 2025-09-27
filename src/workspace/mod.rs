@@ -220,11 +220,24 @@ impl WorkspaceManager {
     }
 
     pub async fn send_key_to_active_terminal(&self, key: KeyEvent) -> Result<()> {
-        let active_id = self.active_terminal.read().clone();
+        // Get the active terminal ID first, then drop the lock immediately
+        let active_id = {
+            let guard = self.active_terminal.read();
+            guard.clone()
+        };
+
         if let Some(id) = active_id {
-            let terminals = self.terminals.read();
-            if let Some(terminal) = terminals.iter().find(|t| t.id == id) {
-                terminal.emulator.write().handle_key_event(key)?;
+            // Get the emulator reference, then drop the terminals lock
+            let emulator = {
+                let terminals = self.terminals.read();
+                terminals.iter()
+                    .find(|t| t.id == id)
+                    .map(|t| t.emulator.clone())
+            };
+
+            // Now we can safely write to the emulator without holding other locks
+            if let Some(emulator) = emulator {
+                emulator.write().handle_key_event(key)?;
             }
         }
         Ok(())
@@ -233,29 +246,39 @@ impl WorkspaceManager {
     pub async fn update(&self) -> Result<()> {
         tracing::trace!("WorkspaceManager::update start");
 
-        // Update all terminal emulators to read their output
-        let terminals = self.terminals.read();
+        // Get terminal emulator references first, then drop the lock
+        let emulators: Vec<Arc<RwLock<TerminalEmulator>>> = {
+            let terminals = self.terminals.read();
+            terminals.iter().map(|t| t.emulator.clone()).collect()
+        };
+        // terminals lock is now dropped
+
         let mut had_output = false;
 
-        for terminal in terminals.iter() {
-            // Use is_some() first to avoid any potential blocking
-            if terminal.emulator.try_write().is_some() {
-                // Now get the lock
-                if let Some(mut emulator) = terminal.emulator.try_write() {
-                    match emulator.update() {
-                        Ok(has_output) => {
-                            if has_output {
-                                had_output = true;
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("Failed to update terminal: {}", e);
+        // Update each terminal emulator without holding the terminals lock
+        for emulator in emulators {
+            // Try to get a write lock - if we can't, skip this update
+            if let Some(mut em) = emulator.try_write() {
+                // Skip dead terminals to avoid infinite EOF reading
+                if !em.is_alive() {
+                    tracing::trace!("Skipping update for dead terminal");
+                    continue;
+                }
+
+                match em.update() {
+                    Ok(has_output) => {
+                        if has_output {
+                            had_output = true;
                         }
                     }
+                    Err(e) => {
+                        tracing::warn!("Failed to update terminal: {}", e);
+                    }
                 }
+            } else {
+                tracing::trace!("Skipping terminal update - couldn't get write lock");
             }
         }
-        drop(terminals); // Explicitly drop the read lock
 
         // Signal redraw if we had output
         if had_output {
@@ -316,15 +339,24 @@ impl WorkspaceManager {
     }
 
     pub fn get_terminal_emulator(&self, id: TerminalId) -> Option<Arc<RwLock<TerminalEmulator>>> {
-        self.terminals
-            .read()
+        // Get the emulator and drop the lock immediately
+        let terminals = self.terminals.read();
+        let result = terminals
             .iter()
             .find(|t| t.id == id)
-            .map(|t| t.emulator.clone())
+            .map(|t| t.emulator.clone());
+        drop(terminals);  // Explicitly drop lock
+        result
     }
 
     pub fn get_active_terminal_emulator(&self) -> Option<Arc<RwLock<TerminalEmulator>>> {
-        let active_id = self.active_terminal.read().clone()?;
+        // Get active ID and drop lock immediately
+        let active_id = {
+            let guard = self.active_terminal.read();
+            guard.clone()
+        }?;
+
+        // Now get the emulator without holding the active_terminal lock
         self.get_terminal_emulator(active_id)
     }
 
