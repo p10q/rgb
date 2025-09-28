@@ -1,3 +1,7 @@
+## Update
+
+Deprecated in favor of English per https://x.com/TomHarada1/status/1972172999089606665
+
 # RGB (Rust Good Vibes)
 
 A terminal multiplexer and workspace manager - Rust port of AIWorkbench.
