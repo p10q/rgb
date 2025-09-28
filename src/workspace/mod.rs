@@ -7,6 +7,7 @@ use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -59,12 +60,10 @@ impl WorkspaceManager {
         let id = Uuid::new_v4();
         let title = format!("Terminal {}", self.terminals.read().len() + 1);
 
-        // Get default shell if no command specified
-        let cmd = command.unwrap_or_else(|| {
-            std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string())
-        });
+        // If no command specified, pass empty string to let TerminalEmulator handle shell setup
+        let cmd = command.unwrap_or_else(|| String::new());
 
-        tracing::info!("Creating terminal with command: {}", cmd);
+        tracing::info!("Creating terminal with command: {:?}", cmd);
 
         // Create worktree if git is enabled
         let worktree_path = if self.git_manager.is_git_repo() {
@@ -77,10 +76,7 @@ impl WorkspaceManager {
         let working_dir = worktree_path.clone().unwrap_or_else(|| self.project_dir.clone());
 
         // Create terminal emulator
-        let mut emulator = TerminalEmulator::new(&cmd, &working_dir, (80, 24))?;
-
-        // Send a carriage return to trigger shell prompt display
-        emulator.write(b"\r").ok();
+        let emulator = TerminalEmulator::new(&cmd, &working_dir, (80, 24))?;
 
         // Create Arc for the emulator
         let emulator_arc = Arc::new(RwLock::new(emulator));
@@ -117,8 +113,13 @@ impl WorkspaceManager {
             self.git_manager.cleanup_worktree(id).await?;
         }
 
-        // Remove from terminals list
+        // Shutdown the terminal emulator properly
         let mut terminals = self.terminals.write();
+        if let Some(terminal) = terminals.iter_mut().find(|t| t.id == id) {
+            terminal.emulator.write().shutdown();
+        }
+
+        // Remove from terminals list
         terminals.retain(|t| t.id != id);
 
         // Update active terminal if needed
@@ -265,10 +266,12 @@ impl WorkspaceManager {
                     continue;
                 }
 
+                tracing::trace!("Calling terminal update");
                 match em.update() {
                     Ok(has_output) => {
                         if has_output {
                             had_output = true;
+                            tracing::trace!("Terminal update returned true (redraw needed)");
                         }
                     }
                     Err(e) => {
@@ -276,7 +279,7 @@ impl WorkspaceManager {
                     }
                 }
             } else {
-                tracing::trace!("Skipping terminal update - couldn't get write lock");
+                tracing::warn!("Skipping terminal update - couldn't get write lock");
             }
         }
 

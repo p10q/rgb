@@ -13,7 +13,7 @@ use ratatui::{
     Terminal,
 };
 use std::{io, path::PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -119,13 +119,40 @@ impl RgbApp {
         self.draw_ui();
 
         // Event-driven main loop with continuous terminal monitoring
-        let mut update_interval = tokio::time::interval(Duration::from_millis(50));
+        let mut update_interval = tokio::time::interval(Duration::from_millis(20));  // Faster updates
         update_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let mut last_draw = std::time::Instant::now();
 
         loop {
             if self.should_quit {
                 tracing::debug!("Quit flag set, exiting loop");
                 break;
+            }
+
+            // Check for events first (non-blocking)
+            if event::poll(Duration::from_millis(0))? {
+                match event::read()? {
+                    Event::Key(key) => {
+                        tracing::info!("KEY EVENT RECEIVED: {:?}", key);
+                        self.handle_key_event(key).await?;
+                        self.draw_ui();
+                        last_draw = std::time::Instant::now();
+                    }
+                    Event::Mouse(mouse) => {
+                        tracing::info!("MOUSE EVENT: {:?}", mouse);
+                        self.handle_mouse_event(mouse).await?;
+                        self.draw_ui();
+                        last_draw = std::time::Instant::now();
+                    }
+                    Event::Resize(width, height) => {
+                        tracing::debug!("Terminal resized to {}x{}", width, height);
+                        self.draw_ui();
+                        last_draw = std::time::Instant::now();
+                    }
+                    _ => {}
+                }
+                continue;  // Process all pending events before other tasks
             }
 
             tokio::select! {
@@ -134,7 +161,11 @@ impl RgbApp {
                     // Update terminal buffers
                     match self.workspace.update().await {
                         Ok(_) => {
-                            // Workspace update will signal redraw if needed
+                            // Redraw if we haven't drawn recently
+                            if last_draw.elapsed() > Duration::from_millis(50) {
+                                self.draw_ui();
+                                last_draw = std::time::Instant::now();
+                            }
                         },
                         Err(e) => tracing::error!("Workspace update error: {}", e),
                     }
@@ -144,34 +175,12 @@ impl RgbApp {
                 _ = redraw_rx.recv() => {
                     tracing::trace!("Redraw signal received");
                     self.draw_ui();
+                    last_draw = std::time::Instant::now();
                 }
 
-                // Handle keyboard/mouse events
-                _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                    // Use a longer timeout for event polling to ensure we don't miss events
-                    if event::poll(Duration::from_millis(10))? {
-                        tracing::trace!("Event available");
-                        match event::read()? {
-                            Event::Key(key) => {
-                                tracing::info!("KEY EVENT RECEIVED: {:?}", key);
-                                self.handle_key_event(key).await?;
-                                tracing::trace!("Key event handled");
-
-                                // Immediate redraw after input
-                                self.draw_ui();
-                            }
-                            Event::Mouse(mouse) => {
-                                tracing::info!("MOUSE EVENT: {:?}", mouse);
-                                self.handle_mouse_event(mouse).await?;
-                                self.draw_ui();
-                            }
-                            Event::Resize(width, height) => {
-                                tracing::debug!("Terminal resized to {}x{}", width, height);
-                                self.draw_ui();
-                            }
-                            _ => {}
-                        }
-                    }
+                // Small delay to prevent busy waiting
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                    // Just yielding to other tasks
                 }
             }
         }
